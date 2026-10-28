@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+Simport React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity, Bell, CalendarDays, Check, CheckCircle2, ChevronLeft, ChevronRight,
@@ -154,7 +154,11 @@ function PageHeading({eyebrow, title, subtitle, action}) {
 function Overview({tasks,pending,completed,dueSoon,classes,setTab,toggleTask,openNewTask,setEditingTask,setTaskModal}) {
   const progress = tasks.length ? Math.round(completed/tasks.length*100) : 0;
   return <>
-    <PageHeading eyebrow="YOUR ACADEMIC COMMAND CENTER" title={<>Stay in your <span className="gradient-text">flow.</span></>} subtitle="A little structure goes a long way. Here's your day at a glance." action={<button className="secondary-btn" onClick={()=>setTab("calendar")}><CalendarDays size={16}/> Open calendar</button>}/>
+    <PageHeading eyebrow="YOUR ACADEMIC COMMAND CENTER" title={<>Stay in your <span className="gradient-text">flow.</span></>} subtitle="A little structure goes a long way. Here's your day at a glance."/>
+    <div className="home-shortcuts" aria-label="Quick links">
+      <button className="quick-card home-shortcut" onClick={()=>setTab("calendar")}><div className="quick-icon blue-bg"><CalendarDays size={20}/></div><div><strong>Open calendar</strong><small>See deadlines and your day at a glance</small></div><ChevronRight size={17}/></button>
+      <button className="quick-card home-shortcut" onClick={()=>setTab("schedule")}><div className="quick-icon teal-bg"><Code2 size={20}/></div><div><strong>Class schedule</strong><small>Open your weekly timetable</small></div><ChevronRight size={17}/></button>
+    </div>
     <div className="welcome-banner"><div className="banner-copy"><div className="banner-tag"><span/> YOUR STUDENT SPACE</div><h2>Small steps. <span>Big semester.</span></h2><p>Keep your tasks clear, your schedule balanced, and your goals in sight.</p><button className="banner-btn" onClick={openNewTask}>Plan something <ChevronRight size={16}/></button></div><div className="banner-art"><div className="orbit-ring ring-one"/><div className="orbit-ring ring-two"/><div className="planet"><GraduationCap size={34}/></div><div className="float-card float-card-one"><CheckCircle2 size={15}/> <span>Keep going!</span></div><div className="float-card float-card-two"><CalendarClock size={15}/><span>One day at a time</span></div><div className="star star-one">✦</div><div className="star star-two">✧</div></div></div>
     <div className="stats-grid">
       <StatCard icon={ListTodo} label="Total tasks" value={tasks.length} foot={`${pending.length} still on your list`} color="purple"/>
@@ -168,8 +172,6 @@ function Overview({tasks,pending,completed,dueSoon,classes,setTab,toggleTask,ope
       </section>
       <section className="panel progress-panel"><div className="panel-heading"><div><h3>Your progress</h3><p>Every task counts</p></div><div className="panel-icon"><Activity size={18}/></div></div><div className="progress-ring-wrap"><svg viewBox="0 0 160 160" className="progress-ring"><circle cx="80" cy="80" r="65" className="ring-track"/><circle cx="80" cy="80" r="65" className="ring-value" style={{strokeDasharray:`${2*Math.PI*65}`,strokeDashoffset:`${2*Math.PI*65*(1-progress/100)}`}}/></svg><div className="progress-ring-label"><strong>{progress}%</strong><span>completed</span></div></div><div className="progress-legend"><span><i className="legend-purple"/> Completed <strong>{completed}</strong></span><span><i className="legend-muted"/> Remaining <strong>{pending.length}</strong></span></div><div className="focus-tip"><Zap size={16}/><p><strong>Quick tip</strong> Break bigger assignments into smaller tasks to make them easier to start.</p></div></section>
     </div>
-    <div className="section-heading"><div><h3>Quick access</h3><p>Jump back into your school workflow</p></div></div>
-    <div className="quick-grid"><button className="quick-card" onClick={()=>setTab("tasks")}><div className="quick-icon purple-bg"><ListTodo size={20}/></div><div><strong>Task manager</strong><small>Track assignments and deadlines</small></div><ChevronRight size={17}/></button><button className="quick-card" onClick={()=>setTab("calendar")}><div className="quick-icon blue-bg"><CalendarDays size={20}/></div><div><strong>Calendar planner</strong><small>See your week and due dates</small></div><ChevronRight size={17}/></button><button className="quick-card" onClick={()=>setTab("schedule")}><div className="quick-icon teal-bg"><Code2 size={20}/></div><div><strong>Class schedule</strong><small>Edit your weekly timetable</small></div><ChevronRight size={17}/></button></div>
   </>;
 }
 function StatCard({icon:Icon,label,value,foot,color}) {return <div className="stat-card"><div className={`stat-icon ${color}`}><Icon size={19}/></div><div className="stat-label">{label}</div><div className="stat-value">{value}</div><div className="stat-foot">{foot}</div></div>}
