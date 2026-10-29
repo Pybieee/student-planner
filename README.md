@@ -1,17 +1,15 @@
-# Orbit — Student Planner
+# Orbit — Personal Student Planner
 
-A responsive dark-mode student organizer built with React and Vite.
+A simple, responsive, dark-mode planner built with React and Vite. It has two pages: a monthly task calendar and a recurring weekly class schedule.
 
 ## Features
-- Dashboard with task totals, completion progress, upcoming deadlines, and quick navigation.
-- Create, edit, complete, search, filter, and delete tasks.
-- Task fields: title, course, due date/time, priority, type, and reminder toggle.
-- Calendar month view with task markers and a selected-day panel showing tasks and classes.
-- Separate weekly class schedule with editable class blocks and a sortable table view.
-- Class fields: subject, subject code, day, start/end time, room, instructor, and color.
-- Overlap detection for classes on the same day.
-- Responsive layouts for desktop, tablet, and mobile.
-- Saves tasks and classes in browser `localStorage`.
+- Monthly calendar with today and task days highlighted.
+- Quickly add tasks to a selected date; optional time, subject, and priority details are available on demand.
+- Complete, edit, and delete tasks from the selected day's list.
+- Weekly schedule with days across the top and 30-minute slots from 07:00 to 22:00.
+- Add, edit, and delete recurring classes with subject, professor, room, times, and an accent color.
+- Saves tasks and classes in this browser's `localStorage`; no account or backend is used.
+- Responsive layout for mobile and desktop. The app uses system fonts and works offline after it has loaded.
 
 ## Run locally
 Requirements: Node.js 18+ and npm.
@@ -30,13 +28,10 @@ npm run build
 npm run preview
 ```
 
-## Reminders
-The app can request browser notification permission. Scheduled reminders work while the app page remains open; browsers may delay timers when a tab is suspended. This is a front-end prototype, not a guaranteed background/push notification service. For reliable reminders while the app is closed, add a backend, push notification service, and/or a native mobile wrapper.
-
 ## Data and deployment
-Data is stored locally in the current browser profile and does not sync between devices. For multi-device sync or accounts, connect a backend/database and authentication. To deploy, build with `npm run build` and publish the generated `dist/` folder to a static hosting provider.
+Data stays in the current browser profile on this device and does not sync to other devices. Clearing the browser's site data will remove saved tasks and classes. To deploy, build with `npm run build` and publish the generated `dist/` folder to a static hosting provider.
 
 ## Project structure
 - `index.html` — app entry document
 - `src/main.jsx` — React components and app logic
-- `src/styles.css` — dark tech UI and responsive styling
+- `src/styles.css` — theme color variables and responsive styling
