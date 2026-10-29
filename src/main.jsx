@@ -1,14 +1,17 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
-  AlertTriangle, CalendarDays, Camera, Check, ChevronLeft, ChevronRight, Clock3,
-  House, ListChecks, Pencil, Plus, ScanLine, Settings, Trash2, Upload, X,
+  AlignCenter, AlignLeft, AlignRight, AlertTriangle, Bold, CalendarDays, Camera, Check,
+  ChevronLeft, ChevronRight, Clock3, Eraser, FileText, Heading1, Heading2, House,
+  Italic, List, ListChecks, ListOrdered, Pencil, Plus, Redo2, ScanLine, Search,
+  Settings, Strikethrough, Trash2, Underline, Undo2, Upload, X,
 } from "lucide-react";
+import { extractScannedClasses, preprocessScheduleImage, wordsFromOcrResult } from "./scheduleScanner.js";
 import "./styles.css";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const SHORT_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const WEEKDAYS = DAYS.slice(0, 5);
+const SCHEDULE_DAYS = DAYS;
 const CLASS_COLORS = ["#3787f5", "#28b8ad", "#71839b", "#596fea", "#50a3d8"];
 const SCHEDULE_START = 7 * 60;
 const SCHEDULE_END = 20 * 60;
@@ -44,7 +47,7 @@ function formatClock(value) {
 }
 
 function scheduleEntries(classes) {
-  const entries = WEEKDAYS.flatMap((day) => {
+  const entries = SCHEDULE_DAYS.flatMap((day) => {
     const dayClasses = classes
       .map((item) => ({ item, start: timeToMinutes(item.start), end: timeToMinutes(item.end) }))
       .filter(({ item, start, end }) => (
@@ -87,124 +90,6 @@ function scheduleEntries(classes) {
   return entries;
 }
 
-function parseClock(value) {
-  const match = value.match(/(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?/i);
-  if (!match) return null;
-  let hour = Number(match[1]);
-  const minute = Number(match[2] || 0);
-  const meridiem = (match[3] || "").replaceAll(".", "").toLowerCase();
-  if (hour > 23 || minute > 59 || (meridiem && (hour < 1 || hour > 12))) return null;
-  if (meridiem === "pm" && hour < 12) hour += 12;
-  if (meridiem === "am" && hour === 12) hour = 0;
-  return {
-    value: formatTime(hour * 60 + minute),
-    uncertain: !meridiem && hour <= 12,
-  };
-}
-
-function recognizedDays(text) {
-  const found = [];
-  const aliases = [
-    ["Monday", /\bmon(?:day)?\b/i],
-    ["Tuesday", /\btue(?:s(?:day)?)?\b/i],
-    ["Wednesday", /\bwed(?:nesday)?\b/i],
-    ["Thursday", /\bthu(?:r(?:s(?:day)?)?)?\b/i],
-    ["Friday", /\bfri(?:day)?\b/i],
-  ];
-  aliases.forEach(([day, pattern]) => {
-    if (pattern.test(text)) found.push(day);
-  });
-  if (/\bMWF\b|\bM\s*\/\s*W\s*\/\s*F\b/i.test(text)) found.push("Monday", "Wednesday", "Friday");
-  if (/\bTTh\b|\bTR\b|\bT\s*\/\s*(?:Th|R)\b/i.test(text)) found.push("Tuesday", "Thursday");
-  return [...new Set(found)];
-}
-
-function wordsAsLines(words, headers) {
-  const lines = [];
-  [...words].sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0).forEach((word) => {
-    const center = (word.bbox.y0 + word.bbox.y1) / 2;
-    const height = word.bbox.y1 - word.bbox.y0;
-    const wordDay = recognizedDays(word.text)[0] || (headers.length > 1
-      ? headers.reduce((closest, header) => (
-        !closest || Math.abs(header.x - (word.bbox.x0 + word.bbox.x1) / 2)
-          < Math.abs(closest.x - (word.bbox.x0 + word.bbox.x1) / 2) ? header : closest
-      ), null)?.day
-      : "");
-    let line = lines.find((candidate) => (
-      candidate.day === wordDay
-      && Math.abs(candidate.center - center) <= Math.max(10, height * 0.65)
-    ));
-    if (!line) {
-      line = { center, day: wordDay, words: [] };
-      lines.push(line);
-    }
-    line.words.push(word);
-    line.center = line.words.reduce((sum, item) => sum + (item.bbox.y0 + item.bbox.y1) / 2, 0) / line.words.length;
-  });
-  return lines.map((line) => ({
-    text: line.words.map((word) => word.text).join(" "),
-    day: line.day,
-    ocrWords: true,
-    centerX: line.words.reduce((sum, word) => sum + (word.bbox.x0 + word.bbox.x1) / 2, 0) / line.words.length,
-    confidence: Math.round(line.words.reduce((sum, word) => sum + (word.confidence || 0), 0) / line.words.length),
-  }));
-}
-
-function extractScannedClasses(text, words) {
-  const dayHeaders = [];
-  (words || []).forEach((word) => {
-    const day = recognizedDays(word.text)[0];
-    if (day) dayHeaders.push({ day, x: (word.bbox.x0 + word.bbox.x1) / 2 });
-  });
-  const headers = dayHeaders.filter((header, index) => (
-    dayHeaders.findIndex((candidate) => candidate.day === header.day) === index
-  )).sort((a, b) => a.x - b.x);
-  const lines = wordsAsLines(words || [], headers);
-  const sourceLines = lines.length ? lines : text.split(/\r?\n/).map((line) => ({ text: line.trim(), centerX: null, confidence: 0, day: "" }));
-  const candidates = [];
-  sourceLines.forEach((line) => {
-    const timePattern = /\b(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*(?:a\.?m\.?|p\.?m\.?))?|\b(?:1[0-2]|0?[1-9])\s*(?:a\.?m\.?|p\.?m\.?)\b/gi;
-    const matches = [...line.text.matchAll(timePattern)];
-    if (matches.length < 2) return;
-    const start = parseClock(matches[0][0]);
-    const end = parseClock(matches[1][0]);
-    if (!start || !end || start.value >= end.value) return;
-    const days = recognizedDays(line.text);
-    const columnDay = line.day || (line.centerX === null
-      ? ""
-      : headers.reduce((closest, header) => (
-        !closest || Math.abs(header.x - line.centerX) < Math.abs(closest.x - line.centerX) ? header : closest
-      ), null)?.day || "");
-    const targetDays = days.length ? days : columnDay ? [columnDay] : [""];
-    const withoutTimes = line.text.replace(timePattern, " ");
-    const withoutDays = withoutTimes
-      .replace(/\b(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?)\b/gi, " ")
-      .replace(/\bMWF\b|\bM\s*\/\s*W\s*\/\s*F\b|\bTTh\b|\bTR\b|\bT\s*\/\s*(?:Th|R)\b/gi, " ");
-    const roomMatch = withoutDays.match(/\b(?:room|rm\.?|classroom|lab(?:oratory)?|hall|bldg\.?|building)\s*#?\s*[a-z0-9-]+\b/i);
-    const room = roomMatch?.[0]?.trim() || "";
-    const subject = withoutDays.replace(roomMatch?.[0] || "", " ").replace(/[|,;:()[\]{}]/g, " ").replace(/\s+/g, " ").trim();
-    const uncertain = [];
-    if (!subject) uncertain.push("subject");
-    if (!day) uncertain.push("day");
-    if (start.uncertain) uncertain.push("start time");
-    if (end.uncertain) uncertain.push("end time");
-    if (!room) uncertain.push("location");
-    if (line.ocrWords && line.confidence < 65) uncertain.push("OCR confidence");
-    targetDays.forEach((day) => candidates.push({
-      id: newId(),
-      subject,
-      instructor: "",
-      room,
-      day,
-      start: start.value,
-      end: end.value,
-      color: CLASS_COLORS[candidates.length % CLASS_COLORS.length],
-      uncertain: [...uncertain],
-    }));
-  });
-  return candidates;
-}
-
 function isDuplicateClass(candidate, existing) {
   const subject = (candidate.subject || "").toLowerCase().replace(/[^a-z0-9]/g, "");
   return existing.some((item) => (
@@ -225,6 +110,18 @@ function readStored(key) {
   }
 }
 
+function normalizeNote(note) {
+  const content = note?.content ?? note?.html ?? note?.body ?? note?.text ?? "";
+  const updatedAt = note?.updatedAt || note?.updated || new Date().toISOString();
+  const parsedUpdatedAt = Date.parse(updatedAt);
+  return {
+    id: typeof note?.id === "string" ? note.id : newId(),
+    title: typeof note?.title === "string" ? note.title : typeof note?.name === "string" ? note.name : "Untitled note",
+    content: typeof content === "string" ? sanitizeNoteHtml(content) : "",
+    updatedAt: Number.isNaN(parsedUpdatedAt) ? new Date().toISOString() : new Date(parsedUpdatedAt).toISOString(),
+  };
+}
+
 function newId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -237,6 +134,7 @@ function App() {
   const [tab, setTab] = useState("home");
   const [tasks, setTasks] = useState(() => readStored("orbit_tasks"));
   const [classes, setClasses] = useState(() => readStored("orbit_classes"));
+  const [notes, setNotes] = useState(() => readStored("orbit_notes").map(normalizeNote));
   const [selectedDate, setSelectedDate] = useState(localDate());
   const [month, setMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
   const [editingTask, setEditingTask] = useState(null);
@@ -281,6 +179,15 @@ function App() {
     }
   }, [classes]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem("orbit_notes", JSON.stringify(notes));
+    } catch (error) {
+      console.error("Could not save notes to local storage.", error);
+      setNotice("Notes could not be saved on this device. Check your browser storage settings.");
+    }
+  }, [notes]);
+
   const today = localDate();
   function dismissCalendarHint() {
     setCalendarHintVisible(false);
@@ -322,7 +229,7 @@ function App() {
   }
 
   function exportBackup() {
-    const contents = JSON.stringify({ version: 1, tasks, classes }, null, 2);
+    const contents = JSON.stringify({ version: 2, tasks, classes, notes }, null, 2);
     const url = URL.createObjectURL(new Blob([contents], { type: "application/json" }));
     const link = document.createElement("a");
     link.href = url;
@@ -342,13 +249,19 @@ function App() {
       const newTasks = backup.tasks.filter((item) => item && typeof item.title === "string")
         .map((item) => ({ ...item, id: newId() }));
       const newClasses = backup.classes.filter((item) => (
-        item && typeof item.subject === "string" && WEEKDAYS.includes(item.day)
+        item && typeof item.subject === "string" && SCHEDULE_DAYS.includes(item.day)
       )).map((item) => ({ ...item, id: newId() }));
-      const skippedCount = backup.tasks.length - newTasks.length + backup.classes.length - newClasses.length;
+      const backupNotes = Array.isArray(backup.notes) ? backup.notes : [];
+      const newNotes = backupNotes.filter((item) => item && typeof (item.title || item.name) === "string")
+        .map((item) => ({ ...normalizeNote(item), id: newId() }));
+      const skippedCount = backup.tasks.length - newTasks.length
+        + backup.classes.length - newClasses.length
+        + backupNotes.length - newNotes.length;
       setTasks((current) => [...current, ...newTasks]);
       setClasses((current) => [...current, ...newClasses]);
+      setNotes((current) => [...current, ...newNotes]);
       const skippedNotice = skippedCount ? ` ${skippedCount} invalid entr${skippedCount === 1 ? "y was" : "ies were"} skipped.` : "";
-      setNotice(`Imported ${newTasks.length} tasks and ${newClasses.length} classes. Existing data was kept.${skippedNotice}`);
+      setNotice(`Imported ${newTasks.length} tasks, ${newClasses.length} classes, and ${newNotes.length} notes. Existing data was kept.${skippedNotice}`);
     } catch (error) {
       console.error("Could not import planner backup.", error);
       setNotice(error instanceof Error ? error.message : "The backup could not be imported.");
@@ -375,7 +288,7 @@ function App() {
         </a>
         <nav className="top-tabs" aria-label="Planner pages">
           {NAV_ITEMS.map(({ id, label }) => (
-            <button key={id} className={tab === id ? "tab active" : "tab"} aria-current={tab === id ? "page" : undefined} onClick={() => setTab(id)}>{label}</button>
+            <button key={id} className={(tab === id || (tab === "notes" && id === "home")) ? "tab active" : "tab"} aria-current={(tab === id || (tab === "notes" && id === "home")) ? "page" : undefined} onClick={() => setTab(id)}>{label}</button>
           ))}
         </nav>
         <div className="today-label"><span className="today-indicator" />{dateLabel(today, { weekday: "short", month: "short", day: "numeric" })}</div>
@@ -394,6 +307,7 @@ function App() {
             onToggleTask={toggleTask}
             onDeleteTask={deleteTask}
             onEditClass={setEditingClass}
+            noteCount={notes.length}
           />
         ) : tab === "calendar" ? (
           <CalendarPage
@@ -426,6 +340,8 @@ function App() {
             onToggle={toggleTask}
             onDelete={deleteTask}
           />
+        ) : tab === "notes" ? (
+          <NotesPage notes={notes} setNotes={setNotes} onBack={() => setTab("home")} />
         ) : (
           <SettingsPage
             backupInput={backupInput}
@@ -437,7 +353,7 @@ function App() {
 
       <nav className="bottom-tabs" aria-label="Planner pages">
         {NAV_ITEMS.map(({ id, label, icon: Icon }) => (
-          <button key={id} className={tab === id ? "bottom-tab active" : "bottom-tab"} aria-current={tab === id ? "page" : undefined} onClick={() => setTab(id)}>
+          <button key={id} className={(tab === id || (tab === "notes" && id === "home")) ? "bottom-tab active" : "bottom-tab"} aria-current={(tab === id || (tab === "notes" && id === "home")) ? "page" : undefined} onClick={() => setTab(id)}>
             <Icon size={19} /><span>{label === "Class Schedule" ? "Classes" : label}</span>
           </button>
         ))}
@@ -471,7 +387,7 @@ function App() {
   );
 }
 
-function HomePage({ today, tasks, classes, onNavigate, onAddTask, onEditTask, onToggleTask, onDeleteTask, onEditClass }) {
+function HomePage({ today, tasks, classes, onNavigate, onAddTask, onEditTask, onToggleTask, onDeleteTask, onEditClass, noteCount }) {
   const pending = tasks.filter((task) => !task.done);
   const nextTasks = [...pending].sort((a, b) => a.due.localeCompare(b.due) || (a.time || "").localeCompare(b.time || "")).slice(0, 4);
   const todayName = DAYS[(new Date(`${today}T12:00:00`).getDay() + 6) % 7];
@@ -515,6 +431,11 @@ function HomePage({ today, tasks, classes, onNavigate, onAddTask, onEditTask, on
           )}
         </section>
       </div>
+      <button className="panel home-notes-entry" onClick={() => onNavigate("notes")}>
+        <span className="home-notes-icon"><FileText size={19} /></span>
+        <span className="home-notes-copy"><strong>Study notes</strong><small>{noteCount ? `${noteCount} saved ${noteCount === 1 ? "note" : "notes"}` : "Write and organize your study notes"}</small></span>
+        <span className="home-notes-action">Open notes <ChevronRight size={16} /></span>
+      </button>
     </section>
   );
 }
@@ -558,14 +479,248 @@ function SettingsPage({ backupInput, onExport, onImport }) {
     <section className="page settings-page">
       <div className="page-heading"><div><p className="eyebrow">YOUR DATA</p><h1>Settings</h1><p className="page-subtitle">Your planner stays on this device. No account or API key is needed.</p></div></div>
       <section className="panel settings-panel">
-        <div><h2>Planner backup</h2><p>Download a copy of your tasks and classes, or add data from a previous Orbit backup. Importing keeps your existing planner data.</p></div>
+        <div><h2>Planner backup</h2><p>Download a copy of your tasks, classes, and notes, or add data from a previous Orbit backup. Importing keeps your existing planner data.</p></div>
         <div className="settings-actions">
           <button className="secondary-button" onClick={onExport}>Download backup</button>
           <button className="primary-button" onClick={() => backupInput.current?.click()}><Upload size={16} /> Import backup</button>
           <input ref={backupInput} className="visually-hidden" type="file" accept="application/json,.json" onChange={(event) => onImport(event.target.files?.[0])} aria-label="Choose an Orbit planner backup" />
         </div>
-        <p className="settings-storage-note">Tasks and classes are saved in this browser’s local storage.</p>
+        <p className="settings-storage-note">Tasks, classes, and notes are saved in this browser’s local storage.</p>
       </section>
+    </section>
+  );
+}
+
+const NOTE_TAGS = new Set(["A", "B", "BLOCKQUOTE", "BR", "DEL", "DIV", "EM", "H1", "H2", "H3", "I", "INPUT", "LI", "OL", "P", "S", "STRIKE", "STRONG", "U", "UL"]);
+
+function sanitizeNoteHtml(value) {
+  const documentValue = new DOMParser().parseFromString(String(value || ""), "text/html");
+  const dangerousTags = new Set(["IFRAME", "OBJECT", "SCRIPT", "STYLE", "SVG", "MATH", "VIDEO", "AUDIO"]);
+  const sanitizeNode = (parent) => {
+    [...parent.childNodes].forEach((node) => {
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      if (dangerousTags.has(node.tagName)) {
+        node.remove();
+        return;
+      }
+      sanitizeNode(node);
+      if (!NOTE_TAGS.has(node.tagName)) {
+        node.replaceWith(...node.childNodes);
+        return;
+      }
+      const style = node.getAttribute("style") || "";
+      const alignment = style.match(/(?:^|;)\s*text-align\s*:\s*(left|center|right)\s*(?:;|$)/i)?.[1]?.toLowerCase();
+      const href = node.tagName === "A" ? node.getAttribute("href") : "";
+      const checked = node.tagName === "INPUT" && node.type === "checkbox" && node.checked;
+      const checklist = node.tagName === "UL" && node.hasAttribute("data-checklist");
+      [...node.attributes].forEach((attribute) => node.removeAttribute(attribute.name));
+      if (alignment && ["P", "DIV", "H1", "H2", "H3", "BLOCKQUOTE"].includes(node.tagName)) {
+        node.setAttribute("style", `text-align: ${alignment}`);
+      }
+      if (checklist) {
+        node.setAttribute("data-checklist", "true");
+      }
+      if (node.tagName === "INPUT") {
+        node.setAttribute("type", "checkbox");
+        node.disabled = false;
+        if (checked) node.setAttribute("checked", "");
+        else node.removeAttribute("checked");
+      }
+      if (node.tagName === "A" && href && /^(https?:|mailto:)/i.test(href)) {
+        node.setAttribute("href", href);
+        node.setAttribute("rel", "noopener noreferrer");
+        node.setAttribute("target", "_blank");
+      }
+    });
+  };
+  sanitizeNode(documentValue.body);
+  return documentValue.body.innerHTML;
+}
+
+function notePlainText(value) {
+  const documentValue = new DOMParser().parseFromString(String(value || ""), "text/html");
+  return documentValue.body.textContent || "";
+}
+
+function NotesPage({ notes, setNotes, onBack }) {
+  const [selectedId, setSelectedId] = useState(notes[0]?.id || "");
+  const [search, setSearch] = useState("");
+  const [saveStatus, setSaveStatus] = useState("Saved");
+  const editorRef = useRef(null);
+  const saveTimer = useRef(null);
+  const pendingSave = useRef(null);
+  const selectedNote = notes.find((note) => note.id === selectedId) || null;
+  const visibleNotes = notes.filter((note) => (
+    `${note.title} ${notePlainText(note.content)}`.toLowerCase().includes(search.trim().toLowerCase())
+  )).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+
+  useEffect(() => {
+    if (selectedNote && editorRef.current) {
+      editorRef.current.innerHTML = sanitizeNoteHtml(selectedNote.content);
+    }
+  }, [selectedId]);
+
+  useEffect(() => () => {
+    clearTimeout(saveTimer.current);
+    if (pendingSave.current) {
+      updateNote(pendingSave.current.id, { content: sanitizeNoteHtml(pendingSave.current.content) });
+      pendingSave.current = null;
+    }
+  }, []);
+
+  function updateNote(id, changes) {
+    setNotes((current) => current.map((note) => note.id === id
+      ? { ...note, ...changes, updatedAt: new Date().toISOString() }
+      : note));
+  }
+
+  function saveEditor(id, content, immediate = false) {
+    if (!id) return;
+    clearTimeout(saveTimer.current);
+    pendingSave.current = { id, content };
+    setSaveStatus("Saving…");
+    const save = () => {
+      const pending = pendingSave.current;
+      if (!pending) return;
+      updateNote(pending.id, { content: sanitizeNoteHtml(pending.content) });
+      pendingSave.current = null;
+      setSaveStatus("Saved");
+    };
+    if (immediate) save();
+    else saveTimer.current = setTimeout(save, 450);
+  }
+
+  function createNote() {
+    const id = newId();
+    setNotes((current) => [{
+      id,
+      title: "Untitled note",
+      content: "<p><br></p>",
+      updatedAt: new Date().toISOString(),
+    }, ...current]);
+    setSelectedId(id);
+    setSearch("");
+    setSaveStatus("Saved");
+  }
+
+  function deleteNote() {
+    if (!selectedNote || !window.confirm(`Delete "${selectedNote.title || "Untitled note"}"? This cannot be undone.`)) return;
+    const remaining = notes.filter((note) => note.id !== selectedNote.id);
+    setNotes(remaining);
+    setSelectedId(remaining[0]?.id || "");
+  }
+
+  function runEditorCommand(command, value = null) {
+    editorRef.current?.focus();
+    document.execCommand(command, false, value);
+    if (editorRef.current) saveEditor(selectedId, editorRef.current.innerHTML);
+  }
+
+  function clearFormatting() {
+    editorRef.current?.focus();
+    document.execCommand("removeFormat", false);
+    document.execCommand("formatBlock", false, "p");
+    document.execCommand("justifyLeft", false);
+    if (editorRef.current) saveEditor(selectedId, editorRef.current.innerHTML);
+  }
+
+  function insertChecklist() {
+    runEditorCommand("insertHTML", '<ul data-checklist="true"><li><input type="checkbox" />&nbsp;</li></ul><p><br></p>');
+  }
+
+  function pasteSanitized(event) {
+    event.preventDefault();
+    const html = event.clipboardData.getData("text/html");
+    const text = event.clipboardData.getData("text/plain");
+    if (html) document.execCommand("insertHTML", false, sanitizeNoteHtml(html));
+    else document.execCommand("insertText", false, text);
+    if (editorRef.current) saveEditor(selectedId, editorRef.current.innerHTML);
+  }
+
+  function toggleChecklistItem(event) {
+    if (!(event.target instanceof HTMLInputElement) || event.target.type !== "checkbox") return;
+    if (event.target.checked) event.target.setAttribute("checked", "");
+    else event.target.removeAttribute("checked");
+    if (editorRef.current) saveEditor(selectedId, editorRef.current.innerHTML, true);
+  }
+
+  const toolbarButtons = [
+    { label: "Bold", icon: Bold, command: "bold" },
+    { label: "Italic", icon: Italic, command: "italic" },
+    { label: "Underline", icon: Underline, command: "underline" },
+    { label: "Strikethrough", icon: Strikethrough, command: "strikeThrough" },
+    { label: "Heading 1", icon: Heading1, command: "formatBlock", value: "h1" },
+    { label: "Heading 2", icon: Heading2, command: "formatBlock", value: "h2" },
+    { label: "Bulleted list", icon: List, command: "insertUnorderedList" },
+    { label: "Numbered list", icon: ListOrdered, command: "insertOrderedList" },
+    { label: "Checklist", icon: ListChecks, action: insertChecklist },
+    { label: "Align left", icon: AlignLeft, command: "justifyLeft" },
+    { label: "Align center", icon: AlignCenter, command: "justifyCenter" },
+    { label: "Align right", icon: AlignRight, command: "justifyRight" },
+    { label: "Undo", icon: Undo2, command: "undo" },
+    { label: "Redo", icon: Redo2, command: "redo" },
+    { label: "Clear formatting", icon: Eraser, action: clearFormatting },
+  ];
+
+  return (
+    <section className="page notes-page">
+      <div className="page-heading notes-page-heading">
+        <div>
+          <p className="eyebrow">YOUR STUDY SPACE</p>
+          <h1>Notes</h1>
+          <p className="page-subtitle">Write, format, and keep your study notes on this device.</p>
+        </div>
+        <div className="notes-heading-actions">
+          <button className="secondary-button" onClick={onBack}><ChevronLeft size={16} /> Home</button>
+          <button className="primary-button" onClick={createNote}><Plus size={17} /> New note</button>
+        </div>
+      </div>
+      <div className="notes-layout">
+        <aside className="panel notes-list-panel" aria-label="Saved notes">
+          <label className="notes-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search notes" aria-label="Search notes" /></label>
+          <div className="notes-list">
+            {visibleNotes.length ? visibleNotes.map((note) => (
+              <button key={note.id} className={`note-list-item${note.id === selectedId ? " selected" : ""}`} onClick={() => setSelectedId(note.id)}>
+                <strong>{note.title || "Untitled note"}</strong>
+                <span>{new Date(note.updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</span>
+                <small>{notePlainText(note.content).trim().slice(0, 90) || "No text yet"}</small>
+              </button>
+            )) : <p className="notes-empty-list">{search ? "No notes match your search." : "Your saved notes will appear here."}</p>}
+          </div>
+        </aside>
+        <section className="panel note-editor-panel" aria-label="Note editor">
+          {selectedNote ? (
+            <>
+              <div className="note-editor-heading">
+                <input className="note-title-input" value={selectedNote.title} onChange={(event) => updateNote(selectedNote.id, { title: event.target.value })} aria-label="Note title" placeholder="Untitled note" />
+                <div className="note-save-actions"><span role="status">{saveStatus}</span><button className="icon-button delete-button" onClick={deleteNote} aria-label="Delete note"><Trash2 size={17} /></button></div>
+              </div>
+              <div className="note-toolbar" role="toolbar" aria-label="Note formatting">
+                {toolbarButtons.map(({ label, icon: Icon, command, value, action }) => (
+                  <button key={label} type="button" className="note-tool-button" title={label} aria-label={label} onMouseDown={(event) => event.preventDefault()} onClick={action || (() => runEditorCommand(command, value))}><Icon size={16} /></button>
+                ))}
+                <button type="button" className="note-tool-button" title="Normal text" aria-label="Normal text" onMouseDown={(event) => event.preventDefault()} onClick={() => runEditorCommand("formatBlock", "p")}>P</button>
+              </div>
+              <div
+                ref={editorRef}
+                className="note-editor"
+                contentEditable
+                suppressContentEditableWarning
+                role="textbox"
+                aria-label="Note content"
+                aria-multiline="true"
+                data-placeholder="Start writing your study notes…"
+                onInput={() => editorRef.current && saveEditor(selectedNote.id, editorRef.current.innerHTML)}
+                onBlur={() => editorRef.current && saveEditor(selectedNote.id, editorRef.current.innerHTML, true)}
+                onPaste={pasteSanitized}
+                onClick={toggleChecklistItem}
+              />
+            </>
+          ) : (
+            <div className="notes-empty-editor"><FileText size={28} /><h2>{search ? "No matching note" : "Start a study note"}</h2><p>{search ? "Try another search or clear the search field." : "Create a note for class summaries, ideas, and revision."}</p>{!search && <button className="primary-button" onClick={createNote}><Plus size={17} /> Create a note</button>}</div>
+          )}
+        </section>
+      </div>
     </section>
   );
 }
@@ -777,7 +932,6 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
   const hours = Array.from({ length: 14 }, (_, index) => SCHEDULE_START + index * 60);
   const fileInput = useRef(null);
   const cameraInput = useRef(null);
-  const [selectedDay, setSelectedDay] = useState(WEEKDAYS.includes(todayName) ? todayName : "Monday");
   const [ocrProgress, setOcrProgress] = useState(null);
   const [scanError, setScanError] = useState("");
   const [review, setReview] = useState(null);
@@ -785,7 +939,7 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
   const [duplicatesConfirmed, setDuplicatesConfirmed] = useState(false);
   const invalidRows = review?.classes.filter((item) => (
     !item.subject.trim()
-    || !WEEKDAYS.includes(item.day)
+    || !SCHEDULE_DAYS.includes(item.day)
     || timeToMinutes(item.start) === null
     || timeToMinutes(item.end) === null
     || item.start < "07:00"
@@ -825,8 +979,10 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
     }
 
     let worker;
-    setOcrProgress({ status: "Loading the on-device text recognizer…", progress: 0 });
+    setOcrProgress({ status: "Preparing your image…", progress: 0 });
     try {
+      const image = await preprocessScheduleImage(file);
+      setOcrProgress({ status: "Loading the on-device text recognizer…", progress: 0 });
       const { createWorker } = await import("tesseract.js");
       worker = await createWorker("eng", 1, {
         workerPath: `${import.meta.env.BASE_URL}ocr/worker.min.js`,
@@ -838,9 +994,10 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
           progress: Number.isFinite(message.progress) ? message.progress : 0,
         }),
       });
-      const { data } = await worker.recognize(file, {}, { blocks: true });
-      const extracted = extractScannedClasses(data.text || "", data.words || []);
-      setOcrText(data.text || "");
+      const { data } = await worker.recognize(image, {}, { blocks: true });
+      const recognizedText = data.text || "";
+      const extracted = extractScannedClasses(recognizedText, wordsFromOcrResult(data));
+      setOcrText(recognizedText);
       setReview({
         classes: extracted.length ? extracted : [{
           id: newId(),
@@ -854,6 +1011,11 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
           uncertain: ["subject", "day", "start time", "end time", "location"],
         }],
       });
+      if (!recognizedText.trim()) {
+        setScanError("No readable text was found. Try a sharper, brighter image or enter the classes manually.");
+      } else if (!extracted.length) {
+        setScanError("Text was recognized, but no complete class time ranges were found. Review the extracted text and add classes manually.");
+      }
     } catch (error) {
       console.error("Could not scan this schedule image.", error);
       setScanError(error instanceof Error
@@ -899,7 +1061,7 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
         subject: "",
         instructor: "",
         room: "",
-        day: selectedDay,
+        day: "Monday",
         start: "09:00",
         end: "10:00",
         color: CLASS_COLORS[current.classes.length % CLASS_COLORS.length],
@@ -962,7 +1124,7 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
           <input ref={cameraInput} className="visually-hidden" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" capture="environment" onChange={(event) => scanSchedule(event.target.files?.[0])} />
           <button className="secondary-button scan-button" onClick={() => fileInput.current?.click()} disabled={Boolean(ocrProgress)}><ScanLine size={17} /> Scan schedule</button>
           <button className="secondary-button camera-button" onClick={() => cameraInput.current?.click()} disabled={Boolean(ocrProgress)}><Camera size={17} /> Take photo</button>
-          <button className="primary-button" onClick={() => onAdd(WEEKDAYS.includes(todayName) ? todayName : "Monday", "09:00")}><Plus size={17} /> Add class</button>
+          <button className="primary-button" onClick={() => onAdd(SCHEDULE_DAYS.includes(todayName) ? todayName : "Monday", "09:00")}><Plus size={17} /> Add class</button>
         </div>
       </div>
       <p className="scanner-privacy">Images are read on this device. Nothing is uploaded.</p>
@@ -974,11 +1136,11 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
       {scanError && <div className="scan-error" role="alert">{scanError}</div>}
       {classes.length === 0 && <div className="schedule-empty-state">Add a class or tap a time in the grid to start planning your week.</div>}
       <div className="panel schedule-panel">
-        <div className="schedule-scroll desktop-schedule">
+        <div className="schedule-scroll">
           <div className="schedule-grid">
             <div className="schedule-grid-header">
               <div className="schedule-time-heading">TIME</div>
-              {WEEKDAYS.map((day) => (
+              {SCHEDULE_DAYS.map((day) => (
                 <div key={day} className={`schedule-day-heading${day === todayName ? " today-column" : ""}`}>
                   <span>{day.slice(0, 3)}</span><strong>{day}</strong>
                 </div>
@@ -992,30 +1154,12 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
                   </span>
                 ))}
               </div>
-              {WEEKDAYS.map(renderDayColumn)}
-            </div>
-          </div>
-        </div>
-        <div className="mobile-schedule">
-          <div className="schedule-day-picker" role="group" aria-label="Choose schedule day">
-            {WEEKDAYS.map((day) => (
-              <button key={day} type="button" className={selectedDay === day ? "selected" : ""} aria-pressed={selectedDay === day} onClick={() => setSelectedDay(day)}>{day.slice(0, 3)}</button>
-            ))}
-          </div>
-          <div className="schedule-scroll mobile-day-scroll">
-            <div className="mobile-day-header"><span>TIME</span><strong>{selectedDay}</strong></div>
-            <div className="mobile-schedule-body">
-              <div className="schedule-time-column" aria-hidden="true">
-                {hours.map((hour, index) => (
-                  <span key={hour} className={`schedule-time-label${index === hours.length - 1 ? " last-time-label" : ""}`} style={{ top: `${index * HOUR_HEIGHT}px` }}>{formatClock(formatTime(hour))}</span>
-                ))}
-              </div>
-              {renderDayColumn(selectedDay)}
+              {SCHEDULE_DAYS.map(renderDayColumn)}
             </div>
           </div>
         </div>
       </div>
-      <p className="schedule-note">Tap a class to view details, edit, or delete it. Tap an empty time to add a class.</p>
+      <p className="schedule-note">Monday–Sunday are shown together; swipe horizontally on a small screen to see the full week. Tap a class to edit it or an empty time to add one.</p>
       {review && (
         <Modal title="Review scanned classes" onClose={() => { setReview(null); setDuplicatesConfirmed(false); }} wide>
           <p className="scan-review-copy">Review and correct everything before adding it. OCR can misread printed schedules; highlighted fields need your attention.</p>
@@ -1031,7 +1175,7 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
                   </div>
                   <div className="scan-review-fields">
                     <label className={!item.subject.trim() ? "uncertain-field" : ""}>Subject / code<input value={item.subject} onChange={(event) => updateReview(item.id, "subject", event.target.value)} placeholder="Required" /></label>
-                    <label className={!WEEKDAYS.includes(item.day) ? "uncertain-field" : ""}>Day<select value={item.day} onChange={(event) => updateReview(item.id, "day", event.target.value)}><option value="">Choose day</option>{WEEKDAYS.map((day) => <option key={day}>{day}</option>)}</select></label>
+                    <label className={!SCHEDULE_DAYS.includes(item.day) ? "uncertain-field" : ""}>Day<select value={item.day} onChange={(event) => updateReview(item.id, "day", event.target.value)}><option value="">Choose day</option>{SCHEDULE_DAYS.map((day) => <option key={day}>{day}</option>)}</select></label>
                     <label className={!item.start || item.uncertain?.includes("start time") ? "uncertain-field" : ""}>Start<input type="time" value={item.start} onChange={(event) => updateReview(item.id, "start", event.target.value)} /></label>
                     <label className={!item.end || item.uncertain?.includes("end time") ? "uncertain-field" : ""}>End<input type="time" value={item.end} onChange={(event) => updateReview(item.id, "end", event.target.value)} /></label>
                     <label className={!item.room ? "uncertain-field" : ""}>Room / location<input value={item.room} onChange={(event) => updateReview(item.id, "room", event.target.value)} placeholder="Optional" /></label>
@@ -1097,7 +1241,7 @@ function ClassModal({ item, defaults, onClose, onSave, onDelete }) {
     subject: item?.subject || "",
     instructor: item?.instructor || "",
     room: item?.room || "",
-    day: WEEKDAYS.includes(item?.day) ? item.day : defaults?.day || "Monday",
+    day: SCHEDULE_DAYS.includes(item?.day) ? item.day : defaults?.day || "Monday",
     start: item?.start || defaults?.start || "09:00",
     end: item?.end || formatTime(Math.min(timeToMinutes(defaults?.start || "09:00") + 60, SCHEDULE_END)),
     color: item?.color || CLASS_COLORS[0],
@@ -1118,7 +1262,7 @@ function ClassModal({ item, defaults, onClose, onSave, onDelete }) {
         <label>Subject name or code<input autoFocus required value={form.subject} onChange={(event) => setForm({ ...form, subject: event.target.value })} placeholder="e.g. Data Structures" /></label>
         <label>Room or location<input value={form.room} onChange={(event) => setForm({ ...form, room: event.target.value })} placeholder="e.g. Science Hall 204" /></label>
         <label>Instructor (optional)<input value={form.instructor} onChange={(event) => setForm({ ...form, instructor: event.target.value })} placeholder="e.g. Prof. Lee" /></label>
-        <label>Day<select value={form.day} onChange={(event) => setForm({ ...form, day: event.target.value })}>{WEEKDAYS.map((day) => <option key={day}>{day}</option>)}</select></label>
+        <label>Day<select value={form.day} onChange={(event) => setForm({ ...form, day: event.target.value })}>{SCHEDULE_DAYS.map((day) => <option key={day}>{day}</option>)}</select></label>
         <div className="form-row">
           <label>Start time<input type="time" required min="07:00" max="19:59" value={form.start} onChange={(event) => setForm({ ...form, start: event.target.value })} /></label>
           <label>End time<input type="time" required min="07:01" max="20:00" value={form.end} onChange={(event) => setForm({ ...form, end: event.target.value })} /></label>
