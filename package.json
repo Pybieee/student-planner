@@ -4,14 +4,18 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "predev": "node scripts/prepare-ocr-assets.mjs",
     "dev": "vite --host 0.0.0.0",
+    "prebuild": "node scripts/prepare-ocr-assets.mjs",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",

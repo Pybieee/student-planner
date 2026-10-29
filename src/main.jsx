@@ -1,16 +1,25 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
-  AlertTriangle, CalendarDays, Check, ChevronLeft, ChevronRight, Clock3, ImagePlus,
-  Minus, Pencil, Plus, Settings2, Trash2, X,
+  AlertTriangle, CalendarDays, Camera, Check, ChevronLeft, ChevronRight, Clock3,
+  House, ListChecks, Pencil, Plus, ScanLine, Settings, Trash2, Upload, X,
 } from "lucide-react";
 import "./styles.css";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const SHORT_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const CLASS_COLORS = ["#3b82f6", "#22d3ee", "#a78bfa", "#34d399", "#f59e0b", "#f472b6"];
-const GEMINI_MODEL = "gemini-3.5-flash-lite";
-const BASE_SLOT_MINUTES = 30;
+const WEEKDAYS = DAYS.slice(0, 5);
+const CLASS_COLORS = ["#3787f5", "#28b8ad", "#71839b", "#596fea", "#50a3d8"];
+const SCHEDULE_START = 7 * 60;
+const SCHEDULE_END = 20 * 60;
+const HOUR_HEIGHT = 64;
+const NAV_ITEMS = [
+  { id: "home", label: "Home", icon: House },
+  { id: "calendar", label: "Calendar", icon: CalendarDays },
+  { id: "schedule", label: "Class Schedule", icon: Clock3 },
+  { id: "tasks", label: "Tasks", icon: ListChecks },
+  { id: "settings", label: "Settings", icon: Settings },
+];
 
 function localDate(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
@@ -26,18 +35,184 @@ function timeToMinutes(value) {
   return hours * 60 + minutes;
 }
 
-function scheduleRange(classes) {
-  const starts = classes.map((item) => timeToMinutes(item.start)).filter(Number.isFinite);
-  const ends = classes.map((item) => timeToMinutes(item.end)).filter(Number.isFinite);
-  if (!starts.length || !ends.length) return { start: 7 * 60, end: 22 * 60 };
-  const start = Math.max(0, Math.floor(Math.min(...starts) / BASE_SLOT_MINUTES) * BASE_SLOT_MINUTES);
-  const end = Math.min(24 * 60, Math.ceil(Math.max(...ends) / BASE_SLOT_MINUTES) * BASE_SLOT_MINUTES);
-  return { start, end: Math.max(start + BASE_SLOT_MINUTES, end) };
+function formatClock(value) {
+  const minutes = timeToMinutes(value);
+  if (minutes === null) return value || "";
+  const hour = Math.floor(minutes / 60);
+  const suffix = hour < 12 ? "AM" : "PM";
+  return `${hour % 12 || 12}:${String(minutes % 60).padStart(2, "0")} ${suffix}`;
 }
 
-function scheduleSlots(classes) {
-  const { start, end } = scheduleRange(classes);
-  return Array.from({ length: Math.ceil((end - start) / BASE_SLOT_MINUTES) }, (_, index) => formatTime(start + index * BASE_SLOT_MINUTES));
+function scheduleEntries(classes) {
+  const entries = WEEKDAYS.flatMap((day) => {
+    const dayClasses = classes
+      .map((item) => ({ item, start: timeToMinutes(item.start), end: timeToMinutes(item.end) }))
+      .filter(({ item, start, end }) => (
+        item.day === day && start !== null && end !== null && start < end
+        && start < SCHEDULE_END && end > SCHEDULE_START
+      ))
+      .map(({ item, start, end }) => ({
+        item,
+        start: Math.max(start, SCHEDULE_START),
+        end: Math.min(end, SCHEDULE_END),
+      }))
+      .sort((a, b) => a.start - b.start || a.end - b.end);
+    const groups = [];
+    dayClasses.forEach((entry) => {
+      const group = groups[groups.length - 1];
+      if (!group || entry.start >= group.end) groups.push({ end: entry.end, entries: [entry] });
+      else {
+        group.end = Math.max(group.end, entry.end);
+        group.entries.push(entry);
+      }
+    });
+
+    return groups.flatMap((group) => {
+      const active = [];
+      let laneCount = 0;
+      const positioned = group.entries.map((entry) => {
+        for (let index = active.length - 1; index >= 0; index -= 1) {
+          if (active[index].end <= entry.start) active.splice(index, 1);
+        }
+        const occupied = new Set(active.map((lane) => lane.index));
+        let lane = 0;
+        while (occupied.has(lane)) lane += 1;
+        active.push({ index: lane, end: entry.end });
+        laneCount = Math.max(laneCount, lane + 1);
+        return { ...entry, lane };
+      });
+      return positioned.map((entry) => ({ ...entry, laneCount }));
+    }).map((entry) => ({ ...entry, day }));
+  });
+  return entries;
+}
+
+function parseClock(value) {
+  const match = value.match(/(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?/i);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const minute = Number(match[2] || 0);
+  const meridiem = (match[3] || "").replaceAll(".", "").toLowerCase();
+  if (hour > 23 || minute > 59 || (meridiem && (hour < 1 || hour > 12))) return null;
+  if (meridiem === "pm" && hour < 12) hour += 12;
+  if (meridiem === "am" && hour === 12) hour = 0;
+  return {
+    value: formatTime(hour * 60 + minute),
+    uncertain: !meridiem && hour <= 12,
+  };
+}
+
+function recognizedDays(text) {
+  const found = [];
+  const aliases = [
+    ["Monday", /\bmon(?:day)?\b/i],
+    ["Tuesday", /\btue(?:s(?:day)?)?\b/i],
+    ["Wednesday", /\bwed(?:nesday)?\b/i],
+    ["Thursday", /\bthu(?:r(?:s(?:day)?)?)?\b/i],
+    ["Friday", /\bfri(?:day)?\b/i],
+  ];
+  aliases.forEach(([day, pattern]) => {
+    if (pattern.test(text)) found.push(day);
+  });
+  if (/\bMWF\b|\bM\s*\/\s*W\s*\/\s*F\b/i.test(text)) found.push("Monday", "Wednesday", "Friday");
+  if (/\bTTh\b|\bTR\b|\bT\s*\/\s*(?:Th|R)\b/i.test(text)) found.push("Tuesday", "Thursday");
+  return [...new Set(found)];
+}
+
+function wordsAsLines(words, headers) {
+  const lines = [];
+  [...words].sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0).forEach((word) => {
+    const center = (word.bbox.y0 + word.bbox.y1) / 2;
+    const height = word.bbox.y1 - word.bbox.y0;
+    const wordDay = recognizedDays(word.text)[0] || (headers.length > 1
+      ? headers.reduce((closest, header) => (
+        !closest || Math.abs(header.x - (word.bbox.x0 + word.bbox.x1) / 2)
+          < Math.abs(closest.x - (word.bbox.x0 + word.bbox.x1) / 2) ? header : closest
+      ), null)?.day
+      : "");
+    let line = lines.find((candidate) => (
+      candidate.day === wordDay
+      && Math.abs(candidate.center - center) <= Math.max(10, height * 0.65)
+    ));
+    if (!line) {
+      line = { center, day: wordDay, words: [] };
+      lines.push(line);
+    }
+    line.words.push(word);
+    line.center = line.words.reduce((sum, item) => sum + (item.bbox.y0 + item.bbox.y1) / 2, 0) / line.words.length;
+  });
+  return lines.map((line) => ({
+    text: line.words.map((word) => word.text).join(" "),
+    day: line.day,
+    ocrWords: true,
+    centerX: line.words.reduce((sum, word) => sum + (word.bbox.x0 + word.bbox.x1) / 2, 0) / line.words.length,
+    confidence: Math.round(line.words.reduce((sum, word) => sum + (word.confidence || 0), 0) / line.words.length),
+  }));
+}
+
+function extractScannedClasses(text, words) {
+  const dayHeaders = [];
+  (words || []).forEach((word) => {
+    const day = recognizedDays(word.text)[0];
+    if (day) dayHeaders.push({ day, x: (word.bbox.x0 + word.bbox.x1) / 2 });
+  });
+  const headers = dayHeaders.filter((header, index) => (
+    dayHeaders.findIndex((candidate) => candidate.day === header.day) === index
+  )).sort((a, b) => a.x - b.x);
+  const lines = wordsAsLines(words || [], headers);
+  const sourceLines = lines.length ? lines : text.split(/\r?\n/).map((line) => ({ text: line.trim(), centerX: null, confidence: 0, day: "" }));
+  const candidates = [];
+  sourceLines.forEach((line) => {
+    const timePattern = /\b(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*(?:a\.?m\.?|p\.?m\.?))?|\b(?:1[0-2]|0?[1-9])\s*(?:a\.?m\.?|p\.?m\.?)\b/gi;
+    const matches = [...line.text.matchAll(timePattern)];
+    if (matches.length < 2) return;
+    const start = parseClock(matches[0][0]);
+    const end = parseClock(matches[1][0]);
+    if (!start || !end || start.value >= end.value) return;
+    const days = recognizedDays(line.text);
+    const columnDay = line.day || (line.centerX === null
+      ? ""
+      : headers.reduce((closest, header) => (
+        !closest || Math.abs(header.x - line.centerX) < Math.abs(closest.x - line.centerX) ? header : closest
+      ), null)?.day || "");
+    const targetDays = days.length ? days : columnDay ? [columnDay] : [""];
+    const withoutTimes = line.text.replace(timePattern, " ");
+    const withoutDays = withoutTimes
+      .replace(/\b(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?)\b/gi, " ")
+      .replace(/\bMWF\b|\bM\s*\/\s*W\s*\/\s*F\b|\bTTh\b|\bTR\b|\bT\s*\/\s*(?:Th|R)\b/gi, " ");
+    const roomMatch = withoutDays.match(/\b(?:room|rm\.?|classroom|lab(?:oratory)?|hall|bldg\.?|building)\s*#?\s*[a-z0-9-]+\b/i);
+    const room = roomMatch?.[0]?.trim() || "";
+    const subject = withoutDays.replace(roomMatch?.[0] || "", " ").replace(/[|,;:()[\]{}]/g, " ").replace(/\s+/g, " ").trim();
+    const uncertain = [];
+    if (!subject) uncertain.push("subject");
+    if (!day) uncertain.push("day");
+    if (start.uncertain) uncertain.push("start time");
+    if (end.uncertain) uncertain.push("end time");
+    if (!room) uncertain.push("location");
+    if (line.ocrWords && line.confidence < 65) uncertain.push("OCR confidence");
+    targetDays.forEach((day) => candidates.push({
+      id: newId(),
+      subject,
+      instructor: "",
+      room,
+      day,
+      start: start.value,
+      end: end.value,
+      color: CLASS_COLORS[candidates.length % CLASS_COLORS.length],
+      uncertain: [...uncertain],
+    }));
+  });
+  return candidates;
+}
+
+function isDuplicateClass(candidate, existing) {
+  const subject = (candidate.subject || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return existing.some((item) => (
+    item.day === candidate.day
+    && (item.subject || "").toLowerCase().replace(/[^a-z0-9]/g, "") === subject
+    && item.start === candidate.start
+    && item.end === candidate.end
+  ));
 }
 
 function readStored(key) {
@@ -58,111 +233,8 @@ function dateLabel(value, options = { month: "long", day: "numeric", year: "nume
   return new Date(`${value}T12:00:00`).toLocaleDateString(undefined, options);
 }
 
-function canonicalDay(value) {
-  const day = DAYS.find((name) => name.toLowerCase() === String(value || "").trim().toLowerCase());
-  if (day) return day;
-  const shortDay = SHORT_DAYS.find((name) => name.toLowerCase() === String(value || "").trim().toLowerCase());
-  return shortDay ? DAYS[SHORT_DAYS.indexOf(shortDay)] : "";
-}
-
-function normalizeScannedClasses(value) {
-  if (!Array.isArray(value)) throw new Error("The scan response wasn't a list. Try a clearer schedule photo.");
-  const classes = [];
-  value.forEach((entry, index) => {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return;
-    const rawDays = Array.isArray(entry.days) ? entry.days : [entry.day || ""];
-    const days = [...new Set(rawDays.map(canonicalDay).filter(Boolean))];
-    const shared = {
-      subject: typeof entry.subject === "string" ? entry.subject.trim() : "",
-      instructor: typeof entry.professor === "string" ? entry.professor.trim() : "",
-      room: typeof entry.room === "string" ? entry.room.trim() : "",
-      start: typeof entry.startTime === "string" ? entry.startTime.trim() : "",
-      end: typeof entry.endTime === "string" ? entry.endTime.trim() : "",
-      color: CLASS_COLORS[index % CLASS_COLORS.length],
-    };
-    (days.length ? days : [""]).forEach((day) => classes.push({ ...shared, day, id: newId() }));
-  });
-  if (!classes.length) throw new Error("No classes were found. Try a clearer photo, or add classes manually.");
-  return classes;
-}
-
-function readImageAsBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result || "");
-      const separator = result.indexOf(",");
-      if (separator < 0) {
-        reject(new Error("This image couldn't be read. Try another image."));
-        return;
-      }
-      resolve(result.slice(separator + 1));
-    };
-    reader.onerror = () => reject(new Error("This image couldn't be read. Try another image."));
-    reader.readAsDataURL(file);
-  });
-}
-
-async function callGeminiForSchedule(file, apiKey) {
-  const image = await readImageAsBase64(file);
-  const prompt = [
-    "Read the class schedule in this image and return only valid JSON.",
-    "Return a JSON array of objects with exactly these string fields: subject, professor, room, days, startTime, endTime.",
-    "days must be an array containing one or more weekday names from Monday through Sunday.",
-    "Use 24-hour HH:MM for startTime and endTime.",
-    "Do not guess or infer missing or unreadable information. Use an empty string for unknown subject, professor, room, startTime, or endTime; use an empty array when no day can be read.",
-    "Do not include markdown, comments, or any text outside the JSON array.",
-  ].join(" ");
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45000);
-  let response;
-  try {
-    response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: file.type, data: image } }] }],
-          generationConfig: { responseMimeType: "application/json" },
-        }),
-        signal: controller.signal,
-      },
-    );
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("Gemini took too long to respond. Please try again or add classes manually.");
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-  if (!response.ok) {
-    const errorResult = await response.json().catch(() => null);
-    const apiError = String(errorResult?.error?.message || "").toLowerCase();
-    if (response.status === 401 || response.status === 403 || apiError.includes("api key")) {
-      throw new Error("Gemini couldn't use that API key. Check that it is valid and enabled for the Gemini API.");
-    }
-    if (response.status === 429) throw new Error("The Gemini free-tier limit may have been reached. Try again later, or add classes manually.");
-    if (response.status === 400 && (apiError.includes("image") || apiError.includes("mime") || apiError.includes("file"))) {
-      throw new Error("Gemini couldn't read this image request. Try a JPG, PNG, or WebP screenshot.");
-    }
-    throw new Error(`Gemini is temporarily unavailable (error ${response.status}). Please try again later or add classes manually.`);
-  }
-  const result = await response.json();
-  const text = result.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim();
-  if (!text) throw new Error("Gemini didn't return any schedule data. Try another image or add classes manually.");
-  let parsed;
-  try {
-    parsed = JSON.parse(text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""));
-  } catch {
-    throw new Error("Gemini returned an unreadable result. Try again with a clearer image.");
-  }
-  return normalizeScannedClasses(parsed);
-}
-
 function App() {
-  const [tab, setTab] = useState("calendar");
+  const [tab, setTab] = useState("home");
   const [tasks, setTasks] = useState(() => readStored("orbit_tasks"));
   const [classes, setClasses] = useState(() => readStored("orbit_classes"));
   const [selectedDate, setSelectedDate] = useState(localDate());
@@ -172,6 +244,7 @@ function App() {
   const [editingClass, setEditingClass] = useState(null);
   const [classDefaults, setClassDefaults] = useState(null);
   const [notice, setNotice] = useState("");
+  const backupInput = useRef(null);
   const [calendarHintVisible, setCalendarHintVisible] = useState(() => {
     try {
       return localStorage.getItem("orbit_calendar_hint_dismissed") !== "true"
@@ -180,22 +253,15 @@ function App() {
       return true;
     }
   });
-  const [scheduleZoom, setScheduleZoom] = useState(() => {
+
+  useEffect(() => {
     try {
-      const saved = Number(localStorage.getItem("orbit_schedule_zoom"));
-      return Number.isFinite(saved) && saved > 0 ? Math.min(3, Math.max(0.5, saved)) : 0;
-    } catch {
-      return 1;
-    }
-  });
-  const [geminiKey, setGeminiKey] = useState(() => {
-    try {
-      return localStorage.getItem("orbit_gemini_api_key") || "";
+      localStorage.removeItem("orbit_gemini_api_key");
+      localStorage.removeItem("orbit_schedule_zoom");
     } catch (error) {
-      console.warn("Could not read the Gemini API key from local storage.", error);
-      return "";
+      console.warn("Could not remove legacy schedule settings from local storage.", error);
     }
-  });
+  }, []);
 
   useEffect(() => {
     try {
@@ -214,14 +280,6 @@ function App() {
       setNotice("Classes could not be saved on this device. Check your browser storage settings.");
     }
   }, [classes]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem("orbit_schedule_zoom", String(scheduleZoom));
-    } catch (error) {
-      console.warn("Could not save schedule zoom.", error);
-    }
-  }, [scheduleZoom]);
 
   const today = localDate();
   function dismissCalendarHint() {
@@ -255,27 +313,58 @@ function App() {
     setClassDefaults({ day, start });
   }
 
-  function saveGeminiKey(value) {
-    const key = value.trim();
+  function importScannedClasses(imported) {
+    const duplicates = imported.filter((item) => isDuplicateClass(item, classes));
+    if (duplicates.length) {
+      setNotice(`${duplicates.length} possible duplicate${duplicates.length === 1 ? "" : "s"} kept; nothing was overwritten.`);
+    }
+    setClasses((current) => [...current, ...imported.map((item) => ({ ...item, id: newId() }))]);
+  }
+
+  function exportBackup() {
+    const contents = JSON.stringify({ version: 1, tasks, classes }, null, 2);
+    const url = URL.createObjectURL(new Blob([contents], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `orbit-planner-${localDate()}.json`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setNotice("Planner backup downloaded.");
+  }
+
+  async function importBackup(file) {
+    if (!file) return;
     try {
-      if (key) localStorage.setItem("orbit_gemini_api_key", key);
-      else localStorage.removeItem("orbit_gemini_api_key");
-      setGeminiKey(key);
-      setNotice(key ? "Gemini API key saved on this device." : "Saved Gemini API key removed.");
+      const backup = JSON.parse(await file.text());
+      if (!Array.isArray(backup.tasks) || !Array.isArray(backup.classes)) {
+        throw new Error("This file is not a valid Orbit planner backup.");
+      }
+      const newTasks = backup.tasks.filter((item) => item && typeof item.title === "string")
+        .map((item) => ({ ...item, id: newId() }));
+      const newClasses = backup.classes.filter((item) => (
+        item && typeof item.subject === "string" && WEEKDAYS.includes(item.day)
+      )).map((item) => ({ ...item, id: newId() }));
+      const skippedCount = backup.tasks.length - newTasks.length + backup.classes.length - newClasses.length;
+      setTasks((current) => [...current, ...newTasks]);
+      setClasses((current) => [...current, ...newClasses]);
+      const skippedNotice = skippedCount ? ` ${skippedCount} invalid entr${skippedCount === 1 ? "y was" : "ies were"} skipped.` : "";
+      setNotice(`Imported ${newTasks.length} tasks and ${newClasses.length} classes. Existing data was kept.${skippedNotice}`);
     } catch (error) {
-      console.error("Could not save the Gemini API key.", error);
-      setNotice("The key couldn't be saved in this browser. Check local storage settings.");
+      console.error("Could not import planner backup.", error);
+      setNotice(error instanceof Error ? error.message : "The backup could not be imported.");
+    } finally {
+      if (backupInput.current) backupInput.current.value = "";
     }
   }
 
-  function importClasses(imported) {
-    const conflicts = findOverlaps(imported, classes).length;
-    setClasses((current) => [...current, ...imported.map((item) => ({ ...item, id: newId() }))]);
-    const conflictMessage = conflicts
-      ? ` ${conflicts} potential overlap${conflicts === 1 ? "" : "s"} ${conflicts === 1 ? "was" : "were"} kept without replacing existing classes.`
-      : "";
-    setNotice(`Added ${imported.length} ${imported.length === 1 ? "class" : "classes"}.${conflictMessage}`);
-  }
+  const toggleTask = (id) => setTasks((current) => current.map((task) => (
+    task.id === id ? { ...task, done: !task.done } : task
+  )));
+  const editTask = (task) => {
+    setTaskComposerDate(null);
+    setEditingTask(task);
+  };
+  const deleteTask = (id) => setTasks((current) => current.filter((task) => task.id !== id));
 
   return (
     <div className="app-shell">
@@ -285,15 +374,28 @@ function App() {
           <span>orbit<span className="brand-period">.</span></span>
         </a>
         <nav className="top-tabs" aria-label="Planner pages">
-          <button className={tab === "calendar" ? "tab active" : "tab"} onClick={() => setTab("calendar")}>Calendar</button>
-          <button className={tab === "schedule" ? "tab active" : "tab"} onClick={() => setTab("schedule")}>Schedule</button>
+          {NAV_ITEMS.map(({ id, label }) => (
+            <button key={id} className={tab === id ? "tab active" : "tab"} aria-current={tab === id ? "page" : undefined} onClick={() => setTab(id)}>{label}</button>
+          ))}
         </nav>
         <div className="today-label"><span className="today-indicator" />{dateLabel(today, { weekday: "short", month: "short", day: "numeric" })}</div>
       </header>
 
       <main className="main-content">
         {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice("")} aria-label="Dismiss message"><X size={15} /></button></div>}
-        {tab === "calendar" ? (
+        {tab === "home" ? (
+          <HomePage
+            today={today}
+            tasks={tasks}
+            classes={classes}
+            onNavigate={setTab}
+            onAddTask={() => setTaskComposerDate(today)}
+            onEditTask={editTask}
+            onToggleTask={toggleTask}
+            onDeleteTask={deleteTask}
+            onEditClass={setEditingClass}
+          />
+        ) : tab === "calendar" ? (
           <CalendarPage
             month={month}
             setMonth={setMonth}
@@ -301,31 +403,44 @@ function App() {
             selectedDate={selectedDate}
             setSelectedDate={setSelectedDate}
             tasks={tasks}
-            onToggleTask={(id) => setTasks((current) => current.map((task) => task.id === id ? { ...task, done: !task.done } : task))}
-            onEditTask={setEditingTask}
-            onDeleteTask={(id) => setTasks((current) => current.filter((task) => task.id !== id))}
+            onToggleTask={toggleTask}
+            onEditTask={editTask}
+            onDeleteTask={deleteTask}
             onAddForDate={(date) => setTaskComposerDate(date)}
             hintVisible={calendarHintVisible}
             onDismissHint={dismissCalendarHint}
           />
-        ) : (
+        ) : tab === "schedule" ? (
           <SchedulePage
             classes={classes}
             today={today}
             onAdd={openClass}
             onEdit={setEditingClass}
-            geminiKey={geminiKey}
-            onSaveGeminiKey={saveGeminiKey}
-            onImport={importClasses}
-            zoom={scheduleZoom}
-            setZoom={setScheduleZoom}
+            onImport={importScannedClasses}
+          />
+        ) : tab === "tasks" ? (
+          <TasksPage
+            tasks={tasks}
+            onAdd={() => setTaskComposerDate(today)}
+            onEdit={editTask}
+            onToggle={toggleTask}
+            onDelete={deleteTask}
+          />
+        ) : (
+          <SettingsPage
+            backupInput={backupInput}
+            onExport={exportBackup}
+            onImport={(file) => importBackup(file)}
           />
         )}
       </main>
 
       <nav className="bottom-tabs" aria-label="Planner pages">
-        <button className={tab === "calendar" ? "bottom-tab active" : "bottom-tab"} onClick={() => setTab("calendar")}><CalendarDays size={19} /><span>Calendar</span></button>
-        <button className={tab === "schedule" ? "bottom-tab active" : "bottom-tab"} onClick={() => setTab("schedule")}><Clock3 size={19} /><span>Schedule</span></button>
+        {NAV_ITEMS.map(({ id, label, icon: Icon }) => (
+          <button key={id} className={tab === id ? "bottom-tab active" : "bottom-tab"} aria-current={tab === id ? "page" : undefined} onClick={() => setTab(id)}>
+            <Icon size={19} /><span>{label === "Class Schedule" ? "Classes" : label}</span>
+          </button>
+        ))}
       </nav>
 
       {(editingTask || taskComposerDate) && (
@@ -353,6 +468,105 @@ function App() {
         />
       )}
     </div>
+  );
+}
+
+function HomePage({ today, tasks, classes, onNavigate, onAddTask, onEditTask, onToggleTask, onDeleteTask, onEditClass }) {
+  const pending = tasks.filter((task) => !task.done);
+  const nextTasks = [...pending].sort((a, b) => a.due.localeCompare(b.due) || (a.time || "").localeCompare(b.time || "")).slice(0, 4);
+  const todayName = DAYS[(new Date(`${today}T12:00:00`).getDay() + 6) % 7];
+  const todaysClasses = classes.filter((item) => item.day === todayName).sort((a, b) => a.start.localeCompare(b.start));
+
+  return (
+    <section className="page home-page">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">YOUR PLANNER</p>
+          <h1>Home</h1>
+          <p className="page-subtitle">{dateLabel(today, { weekday: "long", month: "long", day: "numeric" })} · A clear view of what’s ahead.</p>
+        </div>
+      </div>
+      <div className="home-stats">
+        <button className="panel home-stat" onClick={() => onNavigate("tasks")}><span>Open tasks</span><strong>{pending.length}</strong></button>
+        <button className="panel home-stat" onClick={() => onNavigate("schedule")}><span>Weekly classes</span><strong>{classes.length}</strong></button>
+      </div>
+      <div className="home-sections">
+        <section className="panel home-section">
+          <div className="section-heading"><div><p className="eyebrow">UP NEXT</p><h2>Your tasks</h2></div><button className="text-button" onClick={() => onNavigate("tasks")}>All tasks</button></div>
+          {nextTasks.length ? (
+            <TaskList tasks={nextTasks} onEdit={onEditTask} onToggle={onToggleTask} onDelete={onDeleteTask} />
+          ) : (
+            <div className="empty-panel-copy">You’re all caught up. Add a task whenever something comes up.</div>
+          )}
+          <button className="secondary-button home-add-button" onClick={onAddTask}><Plus size={16} /> Add a task</button>
+        </section>
+        <section className="panel home-section">
+          <div className="section-heading"><div><p className="eyebrow">TODAY</p><h2>{todayName}</h2></div><button className="text-button" onClick={() => onNavigate("schedule")}>Full schedule</button></div>
+          {todaysClasses.length ? (
+            <div className="home-class-list">
+              {todaysClasses.map((item) => (
+                <button className="home-class-item" key={item.id} onClick={() => onEditClass(item)} style={{ "--class-accent": item.color || CLASS_COLORS[0] }}>
+                  <span>{formatClock(item.start)}–{formatClock(item.end)}</span><strong>{item.subject}</strong><small>{item.room || "Location not listed"}</small>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-panel-copy">No classes on your schedule today.</div>
+          )}
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function TasksPage({ tasks, onAdd, onEdit, onToggle, onDelete }) {
+  const ordered = [...tasks].sort((a, b) => Number(a.done) - Number(b.done) || a.due.localeCompare(b.due) || (a.time || "").localeCompare(b.time || ""));
+  return (
+    <section className="page tasks-page">
+      <div className="page-heading">
+        <div><p className="eyebrow">STAY ON TRACK</p><h1>Tasks</h1><p className="page-subtitle">{tasks.filter((task) => !task.done).length} left to do.</p></div>
+        <button className="primary-button" onClick={onAdd}><Plus size={17} /> Add task</button>
+      </div>
+      <section className="panel tasks-panel" aria-label="All tasks">
+        {ordered.length ? <TaskList tasks={ordered} onEdit={onEdit} onToggle={onToggle} onDelete={onDelete} /> : (
+          <div className="empty-panel-copy">No tasks yet. Add one to keep track of what’s next.</div>
+        )}
+      </section>
+    </section>
+  );
+}
+
+function TaskList({ tasks, onEdit, onToggle, onDelete }) {
+  return (
+    <ul className="planner-task-list">
+      {tasks.map((task) => (
+        <li className={`planner-task${task.done ? " is-complete" : ""}`} key={task.id}>
+          <button className={`task-check${task.done ? " checked" : ""}`} aria-label={task.done ? `Mark ${task.title} incomplete` : `Mark ${task.title} complete`} onClick={onToggle ? () => onToggle(task.id) : undefined}>{task.done && <Check size={14} />}</button>
+          <button className="planner-task-main" onClick={() => onEdit(task)}>
+            <strong>{task.title}</strong>
+            <span>{dateLabel(task.due, { weekday: "short", month: "short", day: "numeric" })}{task.time ? ` · ${formatClock(task.time)}` : " · Any time"}{task.course ? ` · ${task.course}` : ""}</span>
+          </button>
+          {onDelete && <button className="icon-button delete-button" aria-label={`Delete ${task.title}`} onClick={() => onDelete(task.id)}><Trash2 size={16} /></button>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function SettingsPage({ backupInput, onExport, onImport }) {
+  return (
+    <section className="page settings-page">
+      <div className="page-heading"><div><p className="eyebrow">YOUR DATA</p><h1>Settings</h1><p className="page-subtitle">Your planner stays on this device. No account or API key is needed.</p></div></div>
+      <section className="panel settings-panel">
+        <div><h2>Planner backup</h2><p>Download a copy of your tasks and classes, or add data from a previous Orbit backup. Importing keeps your existing planner data.</p></div>
+        <div className="settings-actions">
+          <button className="secondary-button" onClick={onExport}>Download backup</button>
+          <button className="primary-button" onClick={() => backupInput.current?.click()}><Upload size={16} /> Import backup</button>
+          <input ref={backupInput} className="visually-hidden" type="file" accept="application/json,.json" onChange={(event) => onImport(event.target.files?.[0])} aria-label="Choose an Orbit planner backup" />
+        </div>
+        <p className="settings-storage-note">Tasks and classes are saved in this browser’s local storage.</p>
+      </section>
+    </section>
   );
 }
 
@@ -557,236 +771,186 @@ function CalendarPage({
   );
 }
 
-function findOverlaps(imported, existing) {
-  const overlaps = [];
-  imported.forEach((item, index) => {
-    if (!item.day || !item.start || !item.end) return;
-    existing.forEach((current) => {
-      if (current.day === item.day && current.start && current.end && item.start < current.end && current.start < item.end) {
-        overlaps.push({ imported: item, other: current });
-      }
-    });
-    imported.slice(index + 1).forEach((other) => {
-      if (other.day === item.day && other.start && other.end && item.start < other.end && other.start < item.end) {
-        overlaps.push({ imported: item, other });
-      }
-    });
-  });
-  return overlaps;
-}
-
-function SchedulePage({ classes, today, onAdd, onEdit, geminiKey, onSaveGeminiKey, onImport, zoom, setZoom }) {
+function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
   const todayName = DAYS[(new Date(`${today}T12:00:00`).getDay() + 6) % 7];
+  const entries = scheduleEntries(classes);
+  const hours = Array.from({ length: 14 }, (_, index) => SCHEDULE_START + index * 60);
   const fileInput = useRef(null);
-  const scheduleScroll = useRef(null);
-  const touchState = useRef(null);
-  const previousTap = useRef(null);
-  const tapActionTimer = useRef(null);
-  const suppressNextTap = useRef(false);
-  const zoomRef = useRef(zoom);
-  const [keyDraft, setKeyDraft] = useState(geminiKey);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [isScanning, setIsScanning] = useState(false);
+  const cameraInput = useRef(null);
+  const [selectedDay, setSelectedDay] = useState(WEEKDAYS.includes(todayName) ? todayName : "Monday");
+  const [ocrProgress, setOcrProgress] = useState(null);
   const [scanError, setScanError] = useState("");
   const [review, setReview] = useState(null);
-  const overlaps = review ? findOverlaps(review, classes) : [];
-  const invalidClasses = review?.filter((item) => (
+  const [ocrText, setOcrText] = useState("");
+  const [duplicatesConfirmed, setDuplicatesConfirmed] = useState(false);
+  const invalidRows = review?.classes.filter((item) => (
     !item.subject.trim()
-    || !DAYS.includes(item.day)
-    || !/^([01]\d|2[0-3]):[0-5]\d$/.test(item.start)
-    || !/^([01]\d|2[0-3]):[0-5]\d$/.test(item.end)
-    || item.start >= item.end
+    || !WEEKDAYS.includes(item.day)
+    || timeToMinutes(item.start) === null
+    || timeToMinutes(item.end) === null
     || item.start < "07:00"
-    || item.end > "22:00"
+    || item.end > "20:00"
+    || item.start >= item.end
   )) || [];
-  const slots = scheduleSlots(classes);
-  const { start: rangeStart, end: rangeEnd } = scheduleRange(classes);
-  zoomRef.current = zoom;
+  const duplicateRows = review?.classes.filter((candidate, index, list) => (
+    isDuplicateClass(candidate, classes)
+    || list.slice(0, index).some((previous) => isDuplicateClass(candidate, [previous]))
+  )) || [];
 
-  useEffect(() => {
-    if (zoom > 0) return;
-    const scroll = scheduleScroll.current;
-    if (!scroll) return;
-    const range = scheduleRange(classes);
-    const rowCount = Math.max(1, Math.ceil((range.end - range.start) / BASE_SLOT_MINUTES));
-    const availableHeight = Math.max(250, window.innerHeight - scroll.getBoundingClientRect().top - 115);
-    const mobile = window.matchMedia("(max-width: 700px)").matches;
-    const widthFit = (scroll.clientWidth - (mobile ? 45 : 52)) / (7 * (mobile ? 74 : 82));
-    const heightFit = (availableHeight - 44) / (rowCount * 40);
-    setZoom(Math.max(0.5, Math.min(3, widthFit, heightFit)));
-  }, [classes, setZoom, zoom]);
-
-  useEffect(() => setKeyDraft(geminiKey), [geminiKey]);
-
-  useEffect(() => {
-    const element = scheduleScroll.current;
-    if (!element) return undefined;
-    function onTouchStart(event) {
-      if (event.touches.length === 2) {
-        const [first, second] = event.touches;
-        const distance = Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
-        touchState.current = {
-          distance,
-          zoom: zoomRef.current,
-          isPinching: true,
-          centerX: (first.clientX + second.clientX) / 2,
-          centerY: (first.clientY + second.clientY) / 2,
-          scrollLeft: element.scrollLeft,
-          scrollTop: element.scrollTop,
-        };
-        previousTap.current = null;
-      } else if (event.touches.length === 1) {
-        const touch = event.touches[0];
-        touchState.current = { x: touch.clientX, y: touch.clientY, isPinching: false };
-      }
-    }
-    function onTouchMove(event) {
-      if (event.touches.length !== 2 || !touchState.current?.isPinching) return;
-      event.preventDefault();
-      const [first, second] = event.touches;
-      const distance = Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
-      if (touchState.current.distance > 0) {
-        const factor = distance / touchState.current.distance;
-        const nextZoom = Math.min(3, Math.max(0.5, touchState.current.zoom * factor));
-        const rect = element.getBoundingClientRect();
-        element.scrollLeft = (touchState.current.scrollLeft + touchState.current.centerX - rect.left) * factor - (touchState.current.centerX - rect.left);
-        element.scrollTop = (touchState.current.scrollTop + touchState.current.centerY - rect.top) * factor - (touchState.current.centerY - rect.top);
-        setZoom(nextZoom);
-      }
-    }
-    function onTouchEnd(event) {
-      if (touchState.current?.isPinching) {
-        if (event.touches.length < 2) touchState.current = null;
-        return;
-      }
-      const ended = event.changedTouches[0];
-      if (ended && touchState.current) {
-        const moved = Math.hypot(ended.clientX - touchState.current.x, ended.clientY - touchState.current.y);
-        if (moved < 12) {
-          const now = Date.now();
-          const prior = previousTap.current;
-          if (prior && now - prior.time < 340 && Math.hypot(ended.clientX - prior.x, ended.clientY - prior.y) < 30) {
-            clearTimeout(tapActionTimer.current);
-            suppressNextTap.current = true;
-            setZoom((current) => current <= 1 ? 1.8 : 0.6);
-            previousTap.current = null;
-          } else {
-            previousTap.current = { time: now, x: ended.clientX, y: ended.clientY };
-          }
-        } else {
-          previousTap.current = null;
-        }
-      }
-      touchState.current = null;
-    }
-    element.addEventListener("touchstart", onTouchStart, { passive: true });
-    element.addEventListener("touchmove", onTouchMove, { passive: false });
-    element.addEventListener("touchend", onTouchEnd, { passive: true });
-    element.addEventListener("touchcancel", onTouchEnd, { passive: true });
-    return () => {
-      element.removeEventListener("touchstart", onTouchStart);
-      element.removeEventListener("touchmove", onTouchMove);
-      element.removeEventListener("touchend", onTouchEnd);
-      element.removeEventListener("touchcancel", onTouchEnd);
-    };
-  }, [setZoom]);
-
-  function getFitZoom() {
-    const scroll = scheduleScroll.current;
-    if (!scroll) return 0.5;
-    const rowCount = slots.length;
-    const availableHeight = Math.max(250, window.innerHeight - scroll.getBoundingClientRect().top - 115);
-    const mobile = window.matchMedia("(max-width: 700px)").matches;
-    const widthFit = (scroll.clientWidth - (mobile ? 45 : 52)) / (7 * (mobile ? 74 : 82));
-    const heightFit = (availableHeight - 44) / (rowCount * 40);
-    return Math.max(0.5, Math.min(3, widthFit, heightFit));
+  function addAtTime(event, day) {
+    if (event.target.closest(".class-card")) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const offset = Math.max(0, Math.min(bounds.height, event.clientY - bounds.top));
+    const minutes = Math.floor(offset / HOUR_HEIGHT * 2) * 30;
+    onAdd(day, formatTime(Math.min(SCHEDULE_END - 30, SCHEDULE_START + minutes)));
   }
 
-  function fitSchedule() {
-    const scroll = scheduleScroll.current;
-    if (!scroll) return;
-    setZoom(getFitZoom());
-    scroll.scrollTo({ top: 0, left: 0, behavior: "smooth" });
-  }
-
-  function toggleFitZoom() {
-    const fitZoom = getFitZoom();
-    setZoom((current) => current > fitZoom + 0.08
-      ? fitZoom
-      : Math.min(3, Math.max(fitZoom * 2, 1.6)));
-  }
-
-  function handleTableTap(action) {
-    if (suppressNextTap.current) {
-      suppressNextTap.current = false;
-      return;
-    }
-    clearTimeout(tapActionTimer.current);
-    tapActionTimer.current = setTimeout(action, 260);
-  }
-  async function handleImage(file) {
+  async function scanSchedule(file) {
     setScanError("");
+    setReview(null);
+    setOcrText("");
+    setDuplicatesConfirmed(false);
     if (!file) return;
-    if (fileInput.current) fileInput.current.value = "";
-    if (!file.type.startsWith("image/")) {
-      setScanError("Choose an image file such as JPG, PNG, or WebP.");
+    if (!["image/jpeg", "image/png"].includes(file.type) && !/\.(jpe?g|png)$/i.test(file.name)) {
+      setScanError("Choose a JPG, JPEG, or PNG image.");
+      if (fileInput.current) fileInput.current.value = "";
+      if (cameraInput.current) cameraInput.current.value = "";
       return;
     }
     if (file.size > 15 * 1024 * 1024) {
-      setScanError("That image is larger than 15 MB. Choose a smaller photo or screenshot.");
-      return;
-    }
-    if (!navigator.onLine) {
-      setScanError("You're offline. Connect to the internet to scan, or add classes manually.");
-      return;
-    }
-    if (!geminiKey) {
-      setSettingsOpen(true);
-      setScanError("Add your Gemini API key below before scanning. You can also add classes manually.");
-      return;
-    }
-    setIsScanning(true);
-    try {
-      setReview(await callGeminiForSchedule(file, geminiKey));
-    } catch (error) {
-      console.error("Schedule scan failed.", error);
-      const message = error instanceof Error ? error.message : "";
-      setScanError(!navigator.onLine
-        ? "The connection was lost during scanning. Reconnect and try again, or add classes manually."
-        : message === "Failed to fetch"
-          ? "Couldn't reach Gemini. Check your connection and try again, or add classes manually."
-          : message || "The scan failed. Please try again or add classes manually.");
-    } finally {
-      setIsScanning(false);
+      setScanError("This image is larger than 15 MB. Choose a smaller photo or screenshot.");
       if (fileInput.current) fileInput.current.value = "";
+      if (cameraInput.current) cameraInput.current.value = "";
+      return;
+    }
+
+    let worker;
+    setOcrProgress({ status: "Loading the on-device text recognizer…", progress: 0 });
+    try {
+      const { createWorker } = await import("tesseract.js");
+      worker = await createWorker("eng", 1, {
+        workerPath: `${import.meta.env.BASE_URL}ocr/worker.min.js`,
+        corePath: `${import.meta.env.BASE_URL}ocr/tesseract-core-lstm.wasm.js`,
+        langPath: `${import.meta.env.BASE_URL}ocr/tessdata`,
+        gzip: true,
+        logger: (message) => setOcrProgress({
+          status: message.status === "recognizing text" ? "Reading your schedule…" : "Preparing the on-device text recognizer…",
+          progress: Number.isFinite(message.progress) ? message.progress : 0,
+        }),
+      });
+      const { data } = await worker.recognize(file, {}, { blocks: true });
+      const extracted = extractScannedClasses(data.text || "", data.words || []);
+      setOcrText(data.text || "");
+      setReview({
+        classes: extracted.length ? extracted : [{
+          id: newId(),
+          subject: "",
+          instructor: "",
+          room: "",
+          day: "",
+          start: "",
+          end: "",
+          color: CLASS_COLORS[0],
+          uncertain: ["subject", "day", "start time", "end time", "location"],
+        }],
+      });
+    } catch (error) {
+      console.error("Could not scan this schedule image.", error);
+      setScanError(error instanceof Error
+        ? `The schedule could not be read: ${error.message}`
+        : "The schedule could not be read. You can still add classes manually.");
+    } finally {
+      if (worker) {
+        try {
+          await worker.terminate();
+        } catch (error) {
+          console.error("Could not stop the on-device OCR worker.", error);
+        }
+      }
+      setOcrProgress(null);
+      if (fileInput.current) fileInput.current.value = "";
+      if (cameraInput.current) cameraInput.current.value = "";
     }
   }
 
   function updateReview(id, key, value) {
-    setReview((current) => current.map((item) => item.id === id ? { ...item, [key]: value } : item));
+    const uncertaintyByField = {
+      subject: "subject",
+      day: "day",
+      start: "start time",
+      end: "end time",
+      room: "location",
+    };
+    setReview((current) => ({
+      ...current,
+      classes: current.classes.map((item) => item.id === id ? {
+        ...item,
+        [key]: value,
+        uncertain: item.uncertain?.filter((field) => field !== uncertaintyByField[key]),
+      } : item),
+    }));
   }
 
   function addReviewClass() {
-    setReview((current) => [...current, {
-      id: newId(),
-      subject: "",
-      instructor: "",
-      room: "",
-      day: todayName,
-      start: "",
-      end: "",
-      color: CLASS_COLORS[current.length % CLASS_COLORS.length],
-    }]);
+    setReview((current) => ({
+      ...current,
+      classes: [...current.classes, {
+        id: newId(),
+        subject: "",
+        instructor: "",
+        room: "",
+        day: selectedDay,
+        start: "09:00",
+        end: "10:00",
+        color: CLASS_COLORS[current.classes.length % CLASS_COLORS.length],
+        uncertain: ["subject", "day", "start time", "end time"],
+      }],
+    }));
   }
 
   function confirmImport() {
-    if (invalidClasses.length) return;
-    onImport(review);
+    if (!review?.classes.length || invalidRows.length) return;
+    if (duplicateRows.length && !duplicatesConfirmed) {
+      setDuplicatesConfirmed(true);
+      return;
+    }
+    onImport(review.classes.map(({ uncertain, ...item }) => item));
     setReview(null);
+    setDuplicatesConfirmed(false);
   }
 
+  const renderDayColumn = (day) => (
+    <div
+      key={day}
+      className={`schedule-day-column${day === todayName ? " today-column" : ""}`}
+      onClick={(event) => addAtTime(event, day)}
+      aria-label={`${day} schedule. Tap an empty time to add a class.`}
+    >
+      {entries.filter((entry) => entry.day === day).map((entry) => (
+        <button
+          key={entry.item.id}
+          type="button"
+          className="class-card"
+          style={{
+            "--class-accent": entry.item.color || CLASS_COLORS[0],
+            top: `${((entry.start - SCHEDULE_START) / 60) * HOUR_HEIGHT}px`,
+            height: `${((entry.end - entry.start) / 60) * HOUR_HEIGHT}px`,
+            left: `calc(${(entry.lane / entry.laneCount) * 100}% + 3px)`,
+            width: `calc(${100 / entry.laneCount}% - 6px)`,
+          }}
+          onClick={() => onEdit(entry.item)}
+          aria-label={`${entry.item.subject}, ${day}, ${formatClock(entry.item.start)} to ${formatClock(entry.item.end)}, ${entry.item.room || "location not listed"}. Tap to view, edit, or delete.`}
+          title={`${entry.item.subject} | ${formatClock(entry.item.start)}-${formatClock(entry.item.end)} | ${entry.item.room || "Location not listed"}`}
+        >
+          <strong>{entry.item.subject}</strong>
+          <span>{formatClock(entry.item.start)}-{formatClock(entry.item.end)} · {entry.item.room || "Location not listed"}</span>
+        </button>
+      ))}
+    </div>
+  );
+
   return (
-    <section className="page">
+    <section className="page schedule-page">
       <div className="page-heading">
         <div>
           <p className="eyebrow">REPEATS EVERY WEEK</p>
@@ -794,130 +958,104 @@ function SchedulePage({ classes, today, onAdd, onEdit, geminiKey, onSaveGeminiKe
           <p className="page-subtitle">Your weekly timetable, with every class in its place.</p>
         </div>
         <div className="schedule-actions">
-          <input ref={fileInput} className="visually-hidden" type="file" accept="image/*" onChange={(event) => handleImage(event.target.files?.[0])} />
-          <button className="secondary-button scan-button" onClick={() => fileInput.current?.click()} disabled={isScanning}>
-            <ImagePlus size={16} />{isScanning ? "Scanning..." : "Scan schedule"}
-          </button>
-          <button className="primary-button" onClick={() => onAdd(todayName, "09:00")}><Plus size={17} /> Add class</button>
+          <input ref={fileInput} className="visually-hidden" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" onChange={(event) => scanSchedule(event.target.files?.[0])} />
+          <input ref={cameraInput} className="visually-hidden" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" capture="environment" onChange={(event) => scanSchedule(event.target.files?.[0])} />
+          <button className="secondary-button scan-button" onClick={() => fileInput.current?.click()} disabled={Boolean(ocrProgress)}><ScanLine size={17} /> Scan schedule</button>
+          <button className="secondary-button camera-button" onClick={() => cameraInput.current?.click()} disabled={Boolean(ocrProgress)}><Camera size={17} /> Take photo</button>
+          <button className="primary-button" onClick={() => onAdd(WEEKDAYS.includes(todayName) ? todayName : "Monday", "09:00")}><Plus size={17} /> Add class</button>
         </div>
       </div>
-      <div className="scan-tools">
-        <button className="settings-toggle" onClick={() => setSettingsOpen((open) => !open)} aria-expanded={settingsOpen}>
-          <Settings2 size={15} /> Gemini API key & privacy <span>{settingsOpen ? "−" : "+"}</span>
-        </button>
-        {settingsOpen && (
-          <div className="api-settings">
-            <div className="api-settings-copy">
-              <strong>Use your own Gemini API key</strong>
-              <p>Get a key from <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">Google AI Studio</a>. Scanning sends the selected image to Google Gemini. Your key is stored only in this browser on this device; anyone with access to this browser profile can use it.</p>
-            </div>
-            <form className="key-form" onSubmit={(event) => { event.preventDefault(); onSaveGeminiKey(keyDraft); }}>
-              <input type="password" autoComplete="new-password" value={keyDraft} onChange={(event) => setKeyDraft(event.target.value)} placeholder="Paste Gemini API key" aria-label="Gemini API key" />
-              <button className="secondary-button" type="submit">Save key</button>
-              {geminiKey && <button className="settings-clear" type="button" onClick={() => { setKeyDraft(""); onSaveGeminiKey(""); }}>Remove</button>}
-            </form>
-          </div>
-        )}
-        {scanError && <div className="scan-error" role="alert">{scanError}</div>}
-      </div>
+      <p className="scanner-privacy">Images are read on this device. Nothing is uploaded.</p>
+      {ocrProgress && (
+        <div className="scan-progress" role="status" aria-live="polite">
+          <span>{ocrProgress.status}</span><progress max="1" value={ocrProgress.progress} />
+        </div>
+      )}
+      {scanError && <div className="scan-error" role="alert">{scanError}</div>}
+      {classes.length === 0 && <div className="schedule-empty-state">Add a class or tap a time in the grid to start planning your week.</div>}
       <div className="panel schedule-panel">
-        <div className="schedule-zoom-controls" aria-label="Schedule table zoom controls">
-          <button onClick={() => setZoom((current) => Math.min(3, current + 0.15))} aria-label="Zoom in"><Plus size={15} /></button>
-          <button onClick={() => setZoom((current) => Math.max(0.5, current - 0.15))} aria-label="Zoom out"><Minus size={15} /></button>
-          <button className="fit-button" onClick={fitSchedule}>Fit</button>
-        </div>
-        <div className="schedule-scroll" ref={scheduleScroll}>
-          <table
-            className={`schedule-table${zoom <= 0.82 ? " compact-details" : ""}`}
-            style={{ "--schedule-zoom": zoom || 0.65 }}
-            onDoubleClick={() => { clearTimeout(tapActionTimer.current); toggleFitZoom(); }}
-          >
-            <thead>
-              <tr>
-                <th className="time-column">Time</th>
-                {DAYS.map((day) => <th key={day} className={day === todayName ? "today-column" : ""}>{day.slice(0, 3)}<span>{day}</span></th>)}
-              </tr>
-            </thead>
-            <tbody>
-              {slots.map((time) => (
-                <tr key={time}>
-                  <th className="time-column">{time}</th>
-                  {DAYS.map((day) => {
-                    const startMinutes = timeToMinutes(time) || rangeStart;
-                    const entries = classes.filter((item) => {
-                      const itemStart = timeToMinutes(item.start);
-                      return item.day === day && itemStart !== null && itemStart >= startMinutes && itemStart < startMinutes + BASE_SLOT_MINUTES;
-                    });
-                    return (
-                      <td key={`${day}-${time}`} className={day === todayName ? "today-column" : ""}>
-                        {entries.length ? entries.map((item) => (
-                          <button
-                            key={item.id}
-                            className="class-card"
-                            style={{
-                              "--class-accent": item.color || "var(--accent)",
-                              "--class-duration": Math.max(1, ((timeToMinutes(item.end) || (startMinutes + BASE_SLOT_MINUTES)) - (timeToMinutes(item.start) || startMinutes)) / BASE_SLOT_MINUTES),
-                            }}
-                            onClick={() => handleTableTap(() => onEdit(item))}
-                            aria-label={`Edit ${item.subject}, ${item.instructor}, ${item.room}`}
-                          >
-                            <strong>{item.subject}</strong>
-                            <span>{item.instructor || "Professor not listed"}</span>
-                            <small>{item.room || "Room not listed"} · {item.start}–{item.end}</small>
-                          </button>
-                        )) : (
-                          <button className="empty-slot" onClick={() => handleTableTap(() => onAdd(day, time))} aria-label={`Add class on ${day} at ${time}`}><Plus size={14} /></button>
-                        )}
-                      </td>
-                    );
-                  })}
-                </tr>
+        <div className="schedule-scroll desktop-schedule">
+          <div className="schedule-grid">
+            <div className="schedule-grid-header">
+              <div className="schedule-time-heading">TIME</div>
+              {WEEKDAYS.map((day) => (
+                <div key={day} className={`schedule-day-heading${day === todayName ? " today-column" : ""}`}>
+                  <span>{day.slice(0, 3)}</span><strong>{day}</strong>
+                </div>
               ))}
-            </tbody>
-          </table>
+            </div>
+            <div className="schedule-grid-body">
+              <div className="schedule-time-column" aria-hidden="true">
+                {hours.map((hour, index) => (
+                  <span key={hour} className={`schedule-time-label${index === hours.length - 1 ? " last-time-label" : ""}`} style={{ top: `${index * HOUR_HEIGHT}px` }}>
+                    {formatClock(formatTime(hour))}
+                  </span>
+                ))}
+              </div>
+              {WEEKDAYS.map(renderDayColumn)}
+            </div>
+          </div>
         </div>
-        {classes.length === 0 && <div className="schedule-empty"><strong>Your week is open</strong><p>Tap any time slot to add a class to your weekly schedule.</p></div>}
-      </div>
-      <p className="schedule-note">Showing {formatTime(rangeStart)}–{formatTime(rangeEnd)} · Pinch or use +/− to zoom, Fit to see the day.</p>
-      {review && (
-        <Modal title="Review scanned classes" onClose={() => setReview(null)} wide>
-          <p className="review-intro">Check every result before adding it. Missing details stay blank; edit them here or remove entries you don't need.</p>
-          <div className="review-list">
-            {review.map((item, index) => (
-              <article className={`review-class${overlaps.some((overlap) => overlap.imported.id === item.id || overlap.other.id === item.id) ? " has-overlap" : ""}`} key={item.id}>
-                <div className="review-class-heading">
-                  <strong>Class {index + 1}</strong>
-                  <button className="icon-button delete-button" aria-label={`Remove class ${index + 1}`} onClick={() => setReview((current) => current.filter((entry) => entry.id !== item.id))}><Trash2 size={15} /></button>
-                </div>
-                <div className="review-fields">
-                  <label>Subject<input value={item.subject} onChange={(event) => updateReview(item.id, "subject", event.target.value)} placeholder="Required" /></label>
-                  <label>Professor<input value={item.instructor} onChange={(event) => updateReview(item.id, "instructor", event.target.value)} placeholder="Unknown" /></label>
-                  <label>Room / location<input value={item.room} onChange={(event) => updateReview(item.id, "room", event.target.value)} placeholder="Unknown" /></label>
-                  <label>Day<select value={item.day} onChange={(event) => updateReview(item.id, "day", event.target.value)}><option value="">Choose day</option>{DAYS.map((day) => <option key={day}>{day}</option>)}</select></label>
-                  <label>Start time<input type="time" value={item.start} onChange={(event) => updateReview(item.id, "start", event.target.value)} /></label>
-                  <label>End time<input type="time" value={item.end} onChange={(event) => updateReview(item.id, "end", event.target.value)} /></label>
-                  <label className="review-color-label">Color<input type="color" value={item.color || CLASS_COLORS[0]} onChange={(event) => updateReview(item.id, "color", event.target.value)} /></label>
-                </div>
-              </article>
+        <div className="mobile-schedule">
+          <div className="schedule-day-picker" role="group" aria-label="Choose schedule day">
+            {WEEKDAYS.map((day) => (
+              <button key={day} type="button" className={selectedDay === day ? "selected" : ""} aria-pressed={selectedDay === day} onClick={() => setSelectedDay(day)}>{day.slice(0, 3)}</button>
             ))}
           </div>
-          <button className="review-add" onClick={addReviewClass}><Plus size={15} /> Add another class</button>
-          {invalidClasses.length > 0 && <div className="review-warning"><AlertTriangle size={17} /><span>Complete each class's subject, day, and valid start/end times (07:00–22:00) before importing. Professor and room can be left blank.</span></div>}
-          {overlaps.length > 0 && <div className="review-warning"><AlertTriangle size={17} /><span>{overlaps.length} potential time overlap{overlaps.length === 1 ? "" : "s"} found. Nothing will be overwritten; imported classes will be added alongside existing ones.</span></div>}
-          <div className="modal-actions">
-            <button type="button" className="secondary-button" onClick={() => setReview(null)}>Cancel</button>
-            <button type="button" className="primary-button" disabled={!review.length || invalidClasses.length > 0} onClick={confirmImport}>Add {review.length} {review.length === 1 ? "class" : "classes"}</button>
+          <div className="schedule-scroll mobile-day-scroll">
+            <div className="mobile-day-header"><span>TIME</span><strong>{selectedDay}</strong></div>
+            <div className="mobile-schedule-body">
+              <div className="schedule-time-column" aria-hidden="true">
+                {hours.map((hour, index) => (
+                  <span key={hour} className={`schedule-time-label${index === hours.length - 1 ? " last-time-label" : ""}`} style={{ top: `${index * HOUR_HEIGHT}px` }}>{formatClock(formatTime(hour))}</span>
+                ))}
+              </div>
+              {renderDayColumn(selectedDay)}
+            </div>
+          </div>
+        </div>
+      </div>
+      <p className="schedule-note">Tap a class to view details, edit, or delete it. Tap an empty time to add a class.</p>
+      {review && (
+        <Modal title="Review scanned classes" onClose={() => { setReview(null); setDuplicatesConfirmed(false); }} wide>
+          <p className="scan-review-copy">Review and correct everything before adding it. OCR can misread printed schedules; highlighted fields need your attention.</p>
+          <div className="scan-review-list">
+            {review.classes.map((item, index) => {
+              const invalid = invalidRows.includes(item);
+              const duplicate = isDuplicateClass(item, classes);
+              return (
+                <article key={item.id} className={`scan-review-card${invalid || item.uncertain?.length ? " needs-review" : ""}`}>
+                  <div className="scan-review-heading">
+                    <strong>Class {index + 1}</strong>
+                    <button className="icon-button delete-button" aria-label={`Remove scanned class ${index + 1}`} onClick={() => setReview((current) => ({ ...current, classes: current.classes.filter((entry) => entry.id !== item.id) }))}><Trash2 size={16} /></button>
+                  </div>
+                  <div className="scan-review-fields">
+                    <label className={!item.subject.trim() ? "uncertain-field" : ""}>Subject / code<input value={item.subject} onChange={(event) => updateReview(item.id, "subject", event.target.value)} placeholder="Required" /></label>
+                    <label className={!WEEKDAYS.includes(item.day) ? "uncertain-field" : ""}>Day<select value={item.day} onChange={(event) => updateReview(item.id, "day", event.target.value)}><option value="">Choose day</option>{WEEKDAYS.map((day) => <option key={day}>{day}</option>)}</select></label>
+                    <label className={!item.start || item.uncertain?.includes("start time") ? "uncertain-field" : ""}>Start<input type="time" value={item.start} onChange={(event) => updateReview(item.id, "start", event.target.value)} /></label>
+                    <label className={!item.end || item.uncertain?.includes("end time") ? "uncertain-field" : ""}>End<input type="time" value={item.end} onChange={(event) => updateReview(item.id, "end", event.target.value)} /></label>
+                    <label className={!item.room ? "uncertain-field" : ""}>Room / location<input value={item.room} onChange={(event) => updateReview(item.id, "room", event.target.value)} placeholder="Optional" /></label>
+                    <label>Color<input className="scan-color-input" type="color" value={item.color || CLASS_COLORS[0]} onChange={(event) => updateReview(item.id, "color", event.target.value)} aria-label="Class color" /></label>
+                  </div>
+                  {invalid && <p className="scan-row-warning"><AlertTriangle size={15} />Add a subject and weekday, and check that the class time is valid (7:00 AM–8:00 PM).</p>}
+                  {!invalid && item.uncertain?.length > 0 && <p className="scan-row-warning"><AlertTriangle size={15} />Please verify: {item.uncertain.join(", ")}.</p>}
+                  {duplicate && <p className="scan-row-warning"><AlertTriangle size={15} />This looks like a class already in your schedule. It will only be added if you confirm below.</p>}
+                </article>
+              );
+            })}
+          </div>
+          <button className="review-add" onClick={addReviewClass}><Plus size={16} /> Add another class</button>
+          {ocrText && <details className="ocr-text-details"><summary>See recognized text</summary><pre>{ocrText}</pre></details>}
+          <div className="modal-actions scan-review-actions">
+            <button type="button" className="secondary-button" onClick={() => { setReview(null); setDuplicatesConfirmed(false); }}>Cancel</button>
+            <button type="button" className="primary-button" disabled={!review.classes.length || invalidRows.length > 0} onClick={confirmImport}>
+              {duplicateRows.length && duplicatesConfirmed ? `Add ${review.classes.length} classes anyway` : "Confirm and Add to Schedule"}
+            </button>
           </div>
         </Modal>
       )}
     </section>
   );
-}
-
-function nextSlot(time) {
-  const [hours, minutes] = time.split(":").map(Number);
-  const next = hours * 60 + minutes + 30;
-  return `${String(Math.floor(next / 60)).padStart(2, "0")}:${String(next % 60).padStart(2, "0")}`;
 }
 
 function TaskModal({ task, due, onClose, onSave, onDelete }) {
@@ -959,16 +1097,16 @@ function ClassModal({ item, defaults, onClose, onSave, onDelete }) {
     subject: item?.subject || "",
     instructor: item?.instructor || "",
     room: item?.room || "",
-    day: item?.day || defaults.day,
-    start: item?.start || defaults.start,
-    end: item?.end || nextSlot(nextSlot(defaults.start)),
+    day: WEEKDAYS.includes(item?.day) ? item.day : defaults?.day || "Monday",
+    start: item?.start || defaults?.start || "09:00",
+    end: item?.end || formatTime(Math.min(timeToMinutes(defaults?.start || "09:00") + 60, SCHEDULE_END)),
     color: item?.color || CLASS_COLORS[0],
   });
   const [error, setError] = useState("");
   function submit(event) {
     event.preventDefault();
-    if (form.start >= form.end) {
-      setError("End time must be later than start time.");
+    if (form.start < "07:00" || form.end > "20:00" || form.start >= form.end) {
+      setError("Choose a valid time between 7:00 AM and 8:00 PM, with the end after the start.");
       return;
     }
     onSave({ ...form, subject: form.subject.trim(), instructor: form.instructor.trim(), room: form.room.trim() });
@@ -977,13 +1115,13 @@ function ClassModal({ item, defaults, onClose, onSave, onDelete }) {
   return (
     <Modal title={item ? "Edit class" : "Add a class"} onClose={onClose}>
       <form className="modal-form" onSubmit={submit}>
-        <label>Subject name<input autoFocus required value={form.subject} onChange={(event) => setForm({ ...form, subject: event.target.value })} placeholder="e.g. Data Structures" /></label>
-        <label>Professor<input required value={form.instructor} onChange={(event) => setForm({ ...form, instructor: event.target.value })} placeholder="e.g. Prof. Lee" /></label>
-        <label>Room or location<input required value={form.room} onChange={(event) => setForm({ ...form, room: event.target.value })} placeholder="e.g. Science Hall 204" /></label>
-        <label>Day<select value={form.day} onChange={(event) => setForm({ ...form, day: event.target.value })}>{DAYS.map((day) => <option key={day}>{day}</option>)}</select></label>
+        <label>Subject name or code<input autoFocus required value={form.subject} onChange={(event) => setForm({ ...form, subject: event.target.value })} placeholder="e.g. Data Structures" /></label>
+        <label>Room or location<input value={form.room} onChange={(event) => setForm({ ...form, room: event.target.value })} placeholder="e.g. Science Hall 204" /></label>
+        <label>Instructor (optional)<input value={form.instructor} onChange={(event) => setForm({ ...form, instructor: event.target.value })} placeholder="e.g. Prof. Lee" /></label>
+        <label>Day<select value={form.day} onChange={(event) => setForm({ ...form, day: event.target.value })}>{WEEKDAYS.map((day) => <option key={day}>{day}</option>)}</select></label>
         <div className="form-row">
-          <label>Start time<input type="time" required min="07:00" max="21:30" value={form.start} onChange={(event) => setForm({ ...form, start: event.target.value })} /></label>
-          <label>End time<input type="time" required min="07:30" max="22:00" value={form.end} onChange={(event) => setForm({ ...form, end: event.target.value })} /></label>
+          <label>Start time<input type="time" required min="07:00" max="19:59" value={form.start} onChange={(event) => setForm({ ...form, start: event.target.value })} /></label>
+          <label>End time<input type="time" required min="07:01" max="20:00" value={form.end} onChange={(event) => setForm({ ...form, end: event.target.value })} /></label>
         </div>
         <label className="color-field">Accent color<div className="color-picker">{CLASS_COLORS.map((color) => (
           <button type="button" key={color} className={`color-swatch${form.color === color ? " selected" : ""}`} style={{ background: color }} onClick={() => setForm({ ...form, color })} aria-label={`Choose ${color}`} />
