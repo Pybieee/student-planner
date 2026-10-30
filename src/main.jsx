@@ -4,24 +4,21 @@ import {
   AlignCenter, AlignLeft, AlignRight, AlertTriangle, Bold, CalendarDays, Camera, Check,
   ChevronLeft, ChevronRight, Clock3, Eraser, FileText, Heading1, Heading2, House,
   Italic, List, ListChecks, ListOrdered, Pencil, Plus, Redo2, ScanLine, Search,
-  Settings, Strikethrough, Trash2, Underline, Undo2, Upload, X,
+  Settings, Strikethrough, Trash2, Underline, Undo2, Upload, X, ZoomIn, ZoomOut, Maximize2,
 } from "lucide-react";
-import { extractScannedClasses, preprocessScheduleImage, wordsFromOcrResult } from "./scheduleScanner.js";
+import { extractScheduleFromImage } from "./services/gemini.js";
 import "./styles.css";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const SHORT_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const SCHEDULE_DAYS = DAYS;
+const DAY_CODES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const CLASS_COLORS = ["#3787f5", "#28b8ad", "#71839b", "#596fea", "#50a3d8"];
-const SCHEDULE_START = 7 * 60;
-const SCHEDULE_END = 20 * 60;
 const HOUR_HEIGHT = 64;
 const NAV_ITEMS = [
-  { id: "home", label: "Home", icon: House },
   { id: "calendar", label: "Calendar", icon: CalendarDays },
-  { id: "schedule", label: "Class Schedule", icon: Clock3 },
-  { id: "tasks", label: "Tasks", icon: ListChecks },
-  { id: "settings", label: "Settings", icon: Settings },
+  { id: "classes", label: "Classes", icon: Clock3 },
+  { id: "notes", label: "Notes", icon: FileText },
 ];
 
 function localDate(date = new Date()) {
@@ -49,16 +46,9 @@ function formatClock(value) {
 function scheduleEntries(classes) {
   const entries = SCHEDULE_DAYS.flatMap((day) => {
     const dayClasses = classes
-      .map((item) => ({ item, start: timeToMinutes(item.start), end: timeToMinutes(item.end) }))
-      .filter(({ item, start, end }) => (
-        item.day === day && start !== null && end !== null && start < end
-        && start < SCHEDULE_END && end > SCHEDULE_START
-      ))
-      .map(({ item, start, end }) => ({
-        item,
-        start: Math.max(start, SCHEDULE_START),
-        end: Math.min(end, SCHEDULE_END),
-      }))
+      .filter((item) => item.days.includes(day))
+      .map((item) => ({ item, start: timeToMinutes(item.startTime), end: timeToMinutes(item.endTime) }))
+      .filter(({ start, end }) => start !== null && end !== null && start < end)
       .sort((a, b) => a.start - b.start || a.end - b.end);
     const groups = [];
     dayClasses.forEach((entry) => {
@@ -90,14 +80,34 @@ function scheduleEntries(classes) {
   return entries;
 }
 
-function isDuplicateClass(candidate, existing) {
-  const subject = (candidate.subject || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-  return existing.some((item) => (
-    item.day === candidate.day
-    && (item.subject || "").toLowerCase().replace(/[^a-z0-9]/g, "") === subject
-    && item.start === candidate.start
-    && item.end === candidate.end
-  ));
+function classesOverlap(candidate, existing) {
+  const start = timeToMinutes(candidate.startTime);
+  const end = timeToMinutes(candidate.endTime);
+  return existing.some((item) => {
+    const existingStart = timeToMinutes(item.startTime);
+    const existingEnd = timeToMinutes(item.endTime);
+    return item.days.some((day) => candidate.days.includes(day))
+      && start !== null && end !== null && existingStart !== null && existingEnd !== null
+      && start < existingEnd && existingStart < end;
+  });
+}
+
+function normalizeClass(item) {
+  const days = Array.isArray(item?.days) ? item.days : item?.day ? [item.day] : [];
+  const dayNames = new Map(DAY_CODES.map((code, index) => [code, SCHEDULE_DAYS[index]]));
+  return {
+    ...item,
+    id: typeof item?.id === "string" ? item.id : newId(),
+    subject: typeof item?.subject === "string" ? item.subject : "",
+    professor: typeof item?.professor === "string"
+      ? item.professor
+      : typeof item?.instructor === "string" ? item.instructor : "",
+    room: typeof item?.room === "string" ? item.room : "",
+    days: [...new Set(days.map((day) => dayNames.get(day) || day).filter((day) => SCHEDULE_DAYS.includes(day)))],
+    startTime: typeof item?.startTime === "string" ? item.startTime : typeof item?.start === "string" ? item.start : "",
+    endTime: typeof item?.endTime === "string" ? item.endTime : typeof item?.end === "string" ? item.end : "",
+    color: typeof item?.color === "string" ? item.color : CLASS_COLORS[0],
+  };
 }
 
 function readStored(key) {
@@ -131,10 +141,18 @@ function dateLabel(value, options = { month: "long", day: "numeric", year: "nume
 }
 
 function App() {
-  const [tab, setTab] = useState("home");
+  const [tab, setTab] = useState("calendar");
   const [tasks, setTasks] = useState(() => readStored("orbit_tasks"));
-  const [classes, setClasses] = useState(() => readStored("orbit_classes"));
+  const [classes, setClasses] = useState(() => readStored("orbit_classes").map(normalizeClass));
   const [notes, setNotes] = useState(() => readStored("orbit_notes").map(normalizeNote));
+  const [geminiApiKey, setGeminiApiKey] = useState(() => {
+    try {
+      return localStorage.getItem("orbit_gemini_api_key") || "";
+    } catch (error) {
+      console.warn("Could not read the Gemini API key from local storage.", error);
+      return "";
+    }
+  });
   const [selectedDate, setSelectedDate] = useState(localDate());
   const [month, setMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1));
   const [editingTask, setEditingTask] = useState(null);
@@ -151,15 +169,6 @@ function App() {
       return true;
     }
   });
-
-  useEffect(() => {
-    try {
-      localStorage.removeItem("orbit_gemini_api_key");
-      localStorage.removeItem("orbit_schedule_zoom");
-    } catch (error) {
-      console.warn("Could not remove legacy schedule settings from local storage.", error);
-    }
-  }, []);
 
   useEffect(() => {
     try {
@@ -208,24 +217,40 @@ function App() {
   }
 
   function saveClass(item) {
+    const savedItem = normalizeClass(item);
+    const otherClasses = classes.filter((entry) => entry.id !== editingClass?.id);
+    if (classesOverlap(savedItem, otherClasses)) {
+      setNotice("This class overlaps an existing class. Both were kept in your schedule; review the timetable.");
+    }
     setClasses((current) => editingClass
-      ? current.map((entry) => entry.id === editingClass.id ? { ...item, id: editingClass.id } : entry)
-      : [...current, { ...item, id: newId() }]);
+      ? current.map((entry) => entry.id === editingClass.id ? { ...savedItem, id: editingClass.id } : entry)
+      : [...current, { ...savedItem, id: newId() }]);
     setEditingClass(null);
     setClassDefaults(null);
   }
 
   function openClass(day, start) {
     setEditingClass(null);
-    setClassDefaults({ day, start });
+    setClassDefaults({ days: [day], startTime: start });
   }
 
   function importScannedClasses(imported) {
-    const duplicates = imported.filter((item) => isDuplicateClass(item, classes));
-    if (duplicates.length) {
-      setNotice(`${duplicates.length} possible duplicate${duplicates.length === 1 ? "" : "s"} kept; nothing was overwritten.`);
+    const overlaps = imported.filter((item) => classesOverlap(item, classes));
+    setClasses((current) => [...current, ...imported.map((item) => ({ ...normalizeClass(item), id: newId() }))]);
+    setNotice(overlaps.length
+      ? `${overlaps.length} scanned class${overlaps.length === 1 ? "" : "es"} overlap existing classes. They were added without overwriting anything; review your schedule.`
+      : `${imported.length} class${imported.length === 1 ? "" : "es"} added to your weekly schedule.`);
+  }
+
+  function saveGeminiApiKey(value) {
+    setGeminiApiKey(value);
+    try {
+      if (value.trim()) localStorage.setItem("orbit_gemini_api_key", value.trim());
+      else localStorage.removeItem("orbit_gemini_api_key");
+    } catch (error) {
+      console.error("Could not save the Gemini API key to local storage.", error);
+      setNotice("The API key could not be saved on this device. Check your browser storage settings.");
     }
-    setClasses((current) => [...current, ...imported.map((item) => ({ ...item, id: newId() }))]);
   }
 
   function exportBackup() {
@@ -249,8 +274,9 @@ function App() {
       const newTasks = backup.tasks.filter((item) => item && typeof item.title === "string")
         .map((item) => ({ ...item, id: newId() }));
       const newClasses = backup.classes.filter((item) => (
-        item && typeof item.subject === "string" && SCHEDULE_DAYS.includes(item.day)
-      )).map((item) => ({ ...item, id: newId() }));
+        item && typeof item.subject === "string"
+        && (Array.isArray(item.days) || SCHEDULE_DAYS.includes(item.day))
+      )).map((item) => ({ ...normalizeClass(item), id: newId() }));
       const backupNotes = Array.isArray(backup.notes) ? backup.notes : [];
       const newNotes = backupNotes.filter((item) => item && typeof (item.title || item.name) === "string")
         .map((item) => ({ ...normalizeNote(item), id: newId() }));
@@ -286,30 +312,12 @@ function App() {
           <span className="brand-mark"><CalendarDays size={20} /></span>
           <span>orbit<span className="brand-period">.</span></span>
         </a>
-        <nav className="top-tabs" aria-label="Planner pages">
-          {NAV_ITEMS.map(({ id, label }) => (
-            <button key={id} className={(tab === id || (tab === "notes" && id === "home")) ? "tab active" : "tab"} aria-current={(tab === id || (tab === "notes" && id === "home")) ? "page" : undefined} onClick={() => setTab(id)}>{label}</button>
-          ))}
-        </nav>
         <div className="today-label"><span className="today-indicator" />{dateLabel(today, { weekday: "short", month: "short", day: "numeric" })}</div>
       </header>
 
       <main className="main-content">
         {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice("")} aria-label="Dismiss message"><X size={15} /></button></div>}
-        {tab === "home" ? (
-          <HomePage
-            today={today}
-            tasks={tasks}
-            classes={classes}
-            onNavigate={setTab}
-            onAddTask={() => setTaskComposerDate(today)}
-            onEditTask={editTask}
-            onToggleTask={toggleTask}
-            onDeleteTask={deleteTask}
-            onEditClass={setEditingClass}
-            noteCount={notes.length}
-          />
-        ) : tab === "calendar" ? (
+        {tab === "calendar" ? (
           <CalendarPage
             month={month}
             setMonth={setMonth}
@@ -317,44 +325,31 @@ function App() {
             selectedDate={selectedDate}
             setSelectedDate={setSelectedDate}
             tasks={tasks}
-            onToggleTask={toggleTask}
             onEditTask={editTask}
             onDeleteTask={deleteTask}
             onAddForDate={(date) => setTaskComposerDate(date)}
             hintVisible={calendarHintVisible}
             onDismissHint={dismissCalendarHint}
           />
-        ) : tab === "schedule" ? (
+        ) : tab === "classes" ? (
           <SchedulePage
             classes={classes}
             today={today}
             onAdd={openClass}
             onEdit={setEditingClass}
             onImport={importScannedClasses}
+            savedApiKey={geminiApiKey}
+            onSaveApiKey={saveGeminiApiKey}
           />
-        ) : tab === "tasks" ? (
-          <TasksPage
-            tasks={tasks}
-            onAdd={() => setTaskComposerDate(today)}
-            onEdit={editTask}
-            onToggle={toggleTask}
-            onDelete={deleteTask}
-          />
-        ) : tab === "notes" ? (
-          <NotesPage notes={notes} setNotes={setNotes} onBack={() => setTab("home")} />
         ) : (
-          <SettingsPage
-            backupInput={backupInput}
-            onExport={exportBackup}
-            onImport={(file) => importBackup(file)}
-          />
+          <NotesPage notes={notes} setNotes={setNotes} />
         )}
       </main>
 
       <nav className="bottom-tabs" aria-label="Planner pages">
         {NAV_ITEMS.map(({ id, label, icon: Icon }) => (
-          <button key={id} className={(tab === id || (tab === "notes" && id === "home")) ? "bottom-tab active" : "bottom-tab"} aria-current={(tab === id || (tab === "notes" && id === "home")) ? "page" : undefined} onClick={() => setTab(id)}>
-            <Icon size={19} /><span>{label === "Class Schedule" ? "Classes" : label}</span>
+          <button key={id} className={tab === id ? "bottom-tab active" : "bottom-tab"} aria-current={tab === id ? "page" : undefined} onClick={() => setTab(id)}>
+            <Icon size={19} /><span>{label}</span>
           </button>
         ))}
       </nav>
@@ -542,10 +537,11 @@ function notePlainText(value) {
   return documentValue.body.textContent || "";
 }
 
-function NotesPage({ notes, setNotes, onBack }) {
-  const [selectedId, setSelectedId] = useState(notes[0]?.id || "");
+function NotesPage({ notes, setNotes }) {
+  const [selectedId, setSelectedId] = useState("");
   const [search, setSearch] = useState("");
   const [saveStatus, setSaveStatus] = useState("Saved");
+  const [wordCount, setWordCount] = useState(0);
   const editorRef = useRef(null);
   const saveTimer = useRef(null);
   const pendingSave = useRef(null);
@@ -556,7 +552,10 @@ function NotesPage({ notes, setNotes, onBack }) {
 
   useEffect(() => {
     if (selectedNote && editorRef.current) {
-      editorRef.current.innerHTML = sanitizeNoteHtml(selectedNote.content);
+      const content = sanitizeNoteHtml(selectedNote.content);
+      editorRef.current.innerHTML = content;
+      const text = notePlainText(content).trim();
+      setWordCount(text ? text.split(/\s+/).length : 0);
     }
   }, [selectedId]);
 
@@ -605,9 +604,8 @@ function NotesPage({ notes, setNotes, onBack }) {
 
   function deleteNote() {
     if (!selectedNote || !window.confirm(`Delete "${selectedNote.title || "Untitled note"}"? This cannot be undone.`)) return;
-    const remaining = notes.filter((note) => note.id !== selectedNote.id);
-    setNotes(remaining);
-    setSelectedId(remaining[0]?.id || "");
+    setNotes(notes.filter((note) => note.id !== selectedNote.id));
+    setSelectedId("");
   }
 
   function runEditorCommand(command, value = null) {
@@ -666,34 +664,24 @@ function NotesPage({ notes, setNotes, onBack }) {
     <section className="page notes-page">
       <div className="page-heading notes-page-heading">
         <div>
-          <p className="eyebrow">YOUR STUDY SPACE</p>
+          <p className="eyebrow">YOUR IDEAS, ALL IN ONE PLACE</p>
           <h1>Notes</h1>
-          <p className="page-subtitle">Write, format, and keep your study notes on this device.</p>
+          <p className="page-subtitle">Capture class notes, reminders, and ideas.</p>
         </div>
-        <div className="notes-heading-actions">
-          <button className="secondary-button" onClick={onBack}><ChevronLeft size={16} /> Home</button>
-          <button className="primary-button" onClick={createNote}><Plus size={17} /> New note</button>
-        </div>
+        {!selectedNote && <div className="notes-heading-actions"><button className="primary-button" onClick={createNote}><Plus size={17} /> New note</button></div>}
       </div>
-      <div className="notes-layout">
-        <aside className="panel notes-list-panel" aria-label="Saved notes">
-          <label className="notes-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search notes" aria-label="Search notes" /></label>
-          <div className="notes-list">
-            {visibleNotes.length ? visibleNotes.map((note) => (
-              <button key={note.id} className={`note-list-item${note.id === selectedId ? " selected" : ""}`} onClick={() => setSelectedId(note.id)}>
-                <strong>{note.title || "Untitled note"}</strong>
-                <span>{new Date(note.updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</span>
-                <small>{notePlainText(note.content).trim().slice(0, 90) || "No text yet"}</small>
-              </button>
-            )) : <p className="notes-empty-list">{search ? "No notes match your search." : "Your saved notes will appear here."}</p>}
-          </div>
-        </aside>
-        <section className="panel note-editor-panel" aria-label="Note editor">
-          {selectedNote ? (
-            <>
+      {selectedNote ? (
+        <>
+          <button type="button" className="notes-back-button" onClick={() => setSelectedId("")}><ChevronLeft size={17} /> All notes</button>
+          <section className="panel note-editor-panel" aria-label="Note editor">
               <div className="note-editor-heading">
                 <input className="note-title-input" value={selectedNote.title} onChange={(event) => updateNote(selectedNote.id, { title: event.target.value })} aria-label="Note title" placeholder="Untitled note" />
                 <div className="note-save-actions"><span role="status">{saveStatus}</span><button className="icon-button delete-button" onClick={deleteNote} aria-label="Delete note"><Trash2 size={17} /></button></div>
+              </div>
+              <div className="note-writing-meta" aria-live="polite">
+                <span>{wordCount} {wordCount === 1 ? "word" : "words"}</span>
+                <span aria-hidden="true">·</span>
+                <span>{wordCount ? `${Math.max(1, Math.ceil(wordCount / 200))} min read` : "Ready to write"}</span>
               </div>
               <div className="note-toolbar" role="toolbar" aria-label="Note formatting">
                 {toolbarButtons.map(({ label, icon: Icon, command, value, action }) => (
@@ -710,43 +698,54 @@ function NotesPage({ notes, setNotes, onBack }) {
                 aria-label="Note content"
                 aria-multiline="true"
                 data-placeholder="Start writing your study notes…"
-                onInput={() => editorRef.current && saveEditor(selectedNote.id, editorRef.current.innerHTML)}
+                onInput={() => {
+                  if (!editorRef.current) return;
+                  const text = editorRef.current.innerText.trim();
+                  setWordCount(text ? text.split(/\s+/).length : 0);
+                  saveEditor(selectedNote.id, editorRef.current.innerHTML);
+                }}
                 onBlur={() => editorRef.current && saveEditor(selectedNote.id, editorRef.current.innerHTML, true)}
                 onPaste={pasteSanitized}
                 onClick={toggleChecklistItem}
               />
-            </>
-          ) : (
-            <div className="notes-empty-editor"><FileText size={28} /><h2>{search ? "No matching note" : "Start a study note"}</h2><p>{search ? "Try another search or clear the search field." : "Create a note for class summaries, ideas, and revision."}</p>{!search && <button className="primary-button" onClick={createNote}><Plus size={17} /> Create a note</button>}</div>
-          )}
-        </section>
-      </div>
+          </section>
+        </>
+      ) : (
+        <>
+          <label className="notes-search notes-board-search"><Search size={17} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search your notes" aria-label="Search notes" /></label>
+          <section className="note-board" aria-label="Saved notes">
+            {visibleNotes.length ? visibleNotes.map((note) => (
+              <button key={note.id} className="note-card" onClick={() => setSelectedId(note.id)}>
+                <strong>{note.title || "Untitled note"}</strong>
+                <span className="note-card-preview">{notePlainText(note.content).trim() || "Tap to add your thoughts…"}</span>
+                <small>{new Date(note.updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</small>
+              </button>
+            )) : (
+              <div className="notes-empty-editor">
+                <FileText size={28} />
+                <h2>{search ? "No matching notes" : "Your notes will show up here"}</h2>
+                <p>{search ? "Try another search or clear the search field." : "Start with a quick note, class summary, or reminder."}</p>
+                {!search && <button className="primary-button" onClick={createNote}><Plus size={17} /> Create a note</button>}
+              </div>
+            )}
+          </section>
+        </>
+      )}
     </section>
   );
 }
 
 function CalendarPage({
   month, setMonth, today, selectedDate, setSelectedDate, tasks,
-  onToggleTask, onEditTask, onDeleteTask, onAddForDate, hintVisible, onDismissHint,
+  onEditTask, onDeleteTask, onAddForDate, hintVisible, onDismissHint,
 }) {
-  const dayRefs = useRef(new Map());
   const pressTimer = useRef(null);
   const pressStart = useRef(null);
   const ignoreClick = useRef(false);
   const suppressCalendarTap = useRef(false);
   const touchStart = useRef(null);
-  const [preview, setPreview] = useState(null);
   const [pulseDate, setPulseDate] = useState("");
-
-  useEffect(() => {
-    if (!preview) return undefined;
-    function closePreview(event) {
-      if (event.target.closest?.(".task-preview") || event.target.closest?.(".calendar-day")) return;
-      setPreview(null);
-    }
-    document.addEventListener("pointerdown", closePreview);
-    return () => document.removeEventListener("pointerdown", closePreview);
-  }, [preview]);
+  const [showSelectedTasks, setShowSelectedTasks] = useState(false);
 
   useEffect(() => () => clearTimeout(pressTimer.current), []);
 
@@ -759,27 +758,14 @@ function CalendarPage({
     return day > 0 && day <= count ? day : null;
   });
 
-  function showTaskPreview(value) {
+  function selectCalendarDay(value) {
     setSelectedDate(value);
-    const dayTasks = tasks.filter((task) => task.due === value);
-    if (!dayTasks.length) {
-      setPreview(null);
-      return;
-    }
-    const rect = dayRefs.current.get(value)?.getBoundingClientRect();
-    const width = Math.min(320, window.innerWidth - 24);
-    const height = Math.min(300, 90 + dayTasks.length * 58);
-    if (!rect) {
-      setPreview(null);
-      return;
-    }
-    const left = Math.max(12, Math.min(rect.left + rect.width / 2 - width / 2, window.innerWidth - width - 12));
-    const bottomInset = window.matchMedia("(max-width: 700px)").matches ? 78 : 12;
-    const top = rect.bottom + height + 12 < window.innerHeight - bottomInset
-      ? rect.bottom + 8
-      : Math.max(12, Math.min(rect.top - height - 8, window.innerHeight - bottomInset - height - 8));
-    setPreview({ date: value, left, top, width });
+    setShowSelectedTasks(true);
   }
+
+  const selectedTasks = tasks
+    .filter((task) => task.due === selectedDate)
+    .sort((a, b) => (a.time || "").localeCompare(b.time || ""));
 
   function beginLongPress(event, value) {
     if (event.button !== undefined && event.button !== 0) return;
@@ -789,7 +775,7 @@ function CalendarPage({
     pressTimer.current = setTimeout(() => {
       ignoreClick.current = true;
       setSelectedDate(value);
-      setPreview(null);
+      setShowSelectedTasks(true);
       setPulseDate(value);
       setTimeout(() => setPulseDate(""), 380);
       if (navigator.vibrate) navigator.vibrate(12);
@@ -821,7 +807,6 @@ function CalendarPage({
     touchStart.current = null;
     if (Math.abs(distance) < 70) return;
     suppressCalendarTap.current = true;
-    setPreview(null);
     setMonth(new Date(year, monthIndex + (distance < 0 ? 1 : -1), 1));
   }
 
@@ -835,6 +820,35 @@ function CalendarPage({
         </div>
       </div>
       <div className="calendar-layout">
+        {showSelectedTasks && <section className="panel selected-day-panel" aria-label="Selected day tasks" aria-live="polite">
+          <div className="selected-day-heading">
+            <div>
+              <p className="eyebrow">{selectedDate === today ? "TODAY" : "SELECTED DAY"}</p>
+              <h2>{dateLabel(selectedDate, { weekday: "long", month: "long", day: "numeric" })}</h2>
+            </div>
+            <div className="selected-day-actions">
+              <span className="task-count" aria-label={`${selectedTasks.length} tasks`}>{selectedTasks.length}</span>
+              <button className="primary-button" onClick={() => onAddForDate(selectedDate)}><Plus size={16} /> Add task</button>
+              <button className="icon-button" aria-label="Close task list" onClick={() => setShowSelectedTasks(false)}><X size={16} /></button>
+            </div>
+          </div>
+          {selectedTasks.length ? (
+            <ul className="selected-day-list">
+              {selectedTasks.map((task) => (
+                <li className="selected-day-task" key={task.id}>
+                  <button className="selected-day-task-content" onClick={() => onEditTask(task)}>
+                    <strong>{task.title}</strong>
+                    <span>{task.time || "Any time"}{task.course ? ` · ${task.course}` : ""}</span>
+                  </button>
+                  <button className="icon-button" aria-label={`Edit ${task.title}`} onClick={() => onEditTask(task)}><Pencil size={15} /></button>
+                  <button className="icon-button delete-button" aria-label={`Delete ${task.title}`} onClick={() => onDeleteTask(task.id)}><Trash2 size={15} /></button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="selected-day-empty">No tasks for this day yet.</p>
+          )}
+        </section>}
         <section className="panel calendar-panel" aria-label="Monthly calendar" onTouchStart={onCalendarTouchStart} onTouchEnd={onCalendarTouchEnd}>
           <div className="calendar-heading">
             <div>
@@ -843,7 +857,7 @@ function CalendarPage({
             </div>
             <div className="month-controls">
               <button className="icon-button" aria-label="Previous month" onClick={() => setMonth(new Date(year, monthIndex - 1, 1))}><ChevronLeft size={18} /></button>
-              <button className="today-button" onClick={() => { setMonth(new Date(new Date().getFullYear(), new Date().getMonth(), 1)); setSelectedDate(today); }}>Today</button>
+              <button className="today-button" onClick={() => { setMonth(new Date(new Date().getFullYear(), new Date().getMonth(), 1)); setSelectedDate(today); setShowSelectedTasks(true); }}>Today</button>
               <button className="icon-button" aria-label="Next month" onClick={() => setMonth(new Date(year, monthIndex + 1, 1))}><ChevronRight size={18} /></button>
             </div>
           </div>
@@ -861,10 +875,6 @@ function CalendarPage({
                   disabled={!day}
                   aria-label={day ? `${dateLabel(value)}, ${dayTasks.length} tasks` : undefined}
                   aria-pressed={value === selectedDate}
-                  ref={(element) => {
-                    if (day && element) dayRefs.current.set(value, element);
-                    else if (day) dayRefs.current.delete(value);
-                  }}
                   className={`calendar-day${!day ? " empty-day" : ""}${value === today ? " is-today" : ""}${value === selectedDate ? " is-selected" : ""}${value === pulseDate ? " long-press-pulse" : ""}`}
                   onPointerDown={(event) => day && beginLongPress(event, value)}
                   onPointerMove={moveLongPress}
@@ -882,15 +892,17 @@ function CalendarPage({
                       ignoreClick.current = false;
                       return;
                     }
-                    showTaskPreview(value);
+                    selectCalendarDay(value);
                   }}
                 >
                   {day && <>
                     <span className="date-number">{day}</span>
                     {dayTasks.length > 0 && (
-                      <span className="date-task-markers" aria-hidden="true">
-                        {dayTasks.slice(0, 3).map((task) => <i key={task.id} />)}
-                        {dayTasks.length > 3 && <small>{dayTasks.length}</small>}
+                      <span className="date-task-list" aria-hidden="true">
+                        {dayTasks.slice(0, 2).map((task) => (
+                          <span className={`date-task-chip${task.done ? " is-complete" : ""}`} key={task.id} title={task.title}>{task.title}</span>
+                        ))}
+                        {dayTasks.length > 2 && <span className="date-task-more">+{dayTasks.length - 2} more</span>}
                       </span>
                     )}
                   </>}
@@ -899,74 +911,53 @@ function CalendarPage({
             })}
           </div>
           <div className="calendar-legend"><i /> Days with tasks</div>
-          {hintVisible && <div className="calendar-hint"><span>Tap a day to view tasks · Long press to add a task.</span><button aria-label="Dismiss calendar hint" onClick={onDismissHint}><X size={14} /></button></div>}
+          {hintVisible && <div className="calendar-hint"><span>Tap a day to see its full task list above · Long press to add a task.</span><button aria-label="Dismiss calendar hint" onClick={onDismissHint}><X size={14} /></button></div>}
         </section>
 
       </div>
-      {preview && <div className="task-preview" style={{ left: preview.left, top: preview.top, width: preview.width }} onPointerDown={(event) => event.stopPropagation()}>
-        <div className="preview-heading">
-          <div><p className="eyebrow">{preview.date === today ? "TODAY" : "TASKS"}</p><strong>{dateLabel(preview.date, { weekday: "short", month: "short", day: "numeric" })}</strong></div>
-          <button className="icon-button" aria-label="Close task preview" onClick={() => setPreview(null)}><X size={16} /></button>
-        </div>
-        <ul className="preview-list">
-          {tasks.filter((task) => task.due === preview.date).sort((a, b) => (a.time || "").localeCompare(b.time || "")).map((task) => (
-            <li className={`preview-task${task.done ? " is-complete" : ""}`} key={task.id}>
-              <button className={`task-check${task.done ? " checked" : ""}`} aria-label={task.done ? `Mark ${task.title} incomplete` : `Mark ${task.title} complete`} onClick={() => onToggleTask(task.id)}>{task.done && <Check size={14} />}</button>
-              <button className="task-content" onClick={() => { setPreview(null); onEditTask(task); }}><span className="task-title">{task.title}</span><span className="task-meta">{task.time || "Any time"}{task.course ? ` · ${task.course}` : ""}</span></button>
-              <button className="icon-button" aria-label={`Edit ${task.title}`} onClick={() => { setPreview(null); onEditTask(task); }}><Pencil size={14} /></button>
-              <button className="icon-button delete-button" aria-label={`Delete ${task.title}`} onClick={() => {
-                onDeleteTask(task.id);
-                if (tasks.filter((item) => item.due === preview.date).length === 1) setPreview(null);
-              }}><Trash2 size={14} /></button>
-            </li>
-          ))}
-        </ul>
-      </div>}
     </section>
   );
 }
 
-function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
+function SchedulePage({ classes, today, onAdd, onEdit, onImport, savedApiKey, onSaveApiKey }) {
   const todayName = DAYS[(new Date(`${today}T12:00:00`).getDay() + 6) % 7];
   const entries = scheduleEntries(classes);
-  const hours = Array.from({ length: 14 }, (_, index) => SCHEDULE_START + index * 60);
+  const firstClassHour = entries.length ? Math.floor(Math.min(...entries.map((entry) => entry.start)) / 60) : 8;
+  const lastClassHour = entries.length ? Math.ceil(Math.max(...entries.map((entry) => entry.end)) / 60) : 18;
+  const firstHour = Math.max(0, Math.min(23, firstClassHour));
+  const lastHour = Math.max(firstHour + 1, Math.min(24, lastClassHour));
+  const hourCount = lastHour - firstHour;
+  const hours = Array.from({ length: hourCount + 1 }, (_, index) => firstHour * 60 + index * 60);
   const fileInput = useRef(null);
   const cameraInput = useRef(null);
-  const [ocrProgress, setOcrProgress] = useState(null);
+  const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
   const [review, setReview] = useState(null);
-  const [ocrText, setOcrText] = useState("");
-  const [duplicatesConfirmed, setDuplicatesConfirmed] = useState(false);
+  const [overlapsConfirmed, setOverlapsConfirmed] = useState(false);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [apiKeyInput, setApiKeyInput] = useState(savedApiKey);
+  const pinchStart = useRef(null);
   const invalidRows = review?.classes.filter((item) => (
     !item.subject.trim()
-    || !SCHEDULE_DAYS.includes(item.day)
-    || timeToMinutes(item.start) === null
-    || timeToMinutes(item.end) === null
-    || item.start < "07:00"
-    || item.end > "20:00"
-    || item.start >= item.end
+    || !item.days.length
+    || timeToMinutes(item.startTime) === null
+    || timeToMinutes(item.endTime) === null
+    || item.startTime >= item.endTime
   )) || [];
-  const duplicateRows = review?.classes.filter((candidate, index, list) => (
-    isDuplicateClass(candidate, classes)
-    || list.slice(0, index).some((previous) => isDuplicateClass(candidate, [previous]))
+  const overlapRows = review?.classes.filter((candidate, index, list) => (
+    classesOverlap(candidate, classes)
+    || list.slice(0, index).some((previous) => classesOverlap(candidate, [previous]))
   )) || [];
-
-  function addAtTime(event, day) {
-    if (event.target.closest(".class-card")) return;
-    const bounds = event.currentTarget.getBoundingClientRect();
-    const offset = Math.max(0, Math.min(bounds.height, event.clientY - bounds.top));
-    const minutes = Math.floor(offset / HOUR_HEIGHT * 2) * 30;
-    onAdd(day, formatTime(Math.min(SCHEDULE_END - 30, SCHEDULE_START + minutes)));
-  }
 
   async function scanSchedule(file) {
     setScanError("");
     setReview(null);
-    setOcrText("");
-    setDuplicatesConfirmed(false);
+    setOverlapsConfirmed(false);
+    setAddMenuOpen(false);
     if (!file) return;
-    if (!["image/jpeg", "image/png"].includes(file.type) && !/\.(jpe?g|png)$/i.test(file.name)) {
-      setScanError("Choose a JPG, JPEG, or PNG image.");
+    if (!file.type.startsWith("image/")) {
+      setScanError("Choose an image file to scan. You can also add a class manually.");
       if (fileInput.current) fileInput.current.value = "";
       if (cameraInput.current) cameraInput.current.value = "";
       return;
@@ -978,115 +969,76 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
       return;
     }
 
-    let worker;
-    setOcrProgress({ status: "Preparing your image…", progress: 0 });
+    setScanning(true);
     try {
-      const image = await preprocessScheduleImage(file);
-      setOcrProgress({ status: "Loading the on-device text recognizer…", progress: 0 });
-      const { createWorker } = await import("tesseract.js");
-      worker = await createWorker("eng", 1, {
-        workerPath: `${import.meta.env.BASE_URL}ocr/worker.min.js`,
-        corePath: `${import.meta.env.BASE_URL}ocr/tesseract-core-lstm.wasm.js`,
-        langPath: `${import.meta.env.BASE_URL}ocr/tessdata`,
-        gzip: true,
-        logger: (message) => setOcrProgress({
-          status: message.status === "recognizing text" ? "Reading your schedule…" : "Preparing the on-device text recognizer…",
-          progress: Number.isFinite(message.progress) ? message.progress : 0,
-        }),
-      });
-      const { data } = await worker.recognize(image, {}, { blocks: true });
-      const recognizedText = data.text || "";
-      const extracted = extractScannedClasses(recognizedText, wordsFromOcrResult(data));
-      setOcrText(recognizedText);
-      setReview({
-        classes: extracted.length ? extracted : [{
-          id: newId(),
-          subject: "",
-          instructor: "",
-          room: "",
-          day: "",
-          start: "",
-          end: "",
-          color: CLASS_COLORS[0],
-          uncertain: ["subject", "day", "start time", "end time", "location"],
-        }],
-      });
-      if (!recognizedText.trim()) {
-        setScanError("No readable text was found. Try a sharper, brighter image or enter the classes manually.");
-      } else if (!extracted.length) {
-        setScanError("Text was recognized, but no complete class time ranges were found. Review the extracted text and add classes manually.");
+      const extracted = await extractScheduleFromImage(file);
+      if (!extracted.length) {
+        setScanError("No classes could be read from this image. You can try another image or add classes manually.");
       }
+      setReview({
+        classes: extracted.map((item, index) => ({
+          id: newId(),
+          subject: item.subject,
+          professor: item.professor,
+          room: item.room,
+          days: item.days.map((code) => SCHEDULE_DAYS[DAY_CODES.indexOf(code)]).filter(Boolean),
+          startTime: item.startTime,
+          endTime: item.endTime,
+          color: CLASS_COLORS[index % CLASS_COLORS.length],
+        })),
+      });
     } catch (error) {
       console.error("Could not scan this schedule image.", error);
-      setScanError(error instanceof Error
-        ? `The schedule could not be read: ${error.message}`
-        : "The schedule could not be read. You can still add classes manually.");
+      setScanError(error instanceof Error ? error.message : "The schedule could not be scanned. Try again or add classes manually.");
     } finally {
-      if (worker) {
-        try {
-          await worker.terminate();
-        } catch (error) {
-          console.error("Could not stop the on-device OCR worker.", error);
-        }
-      }
-      setOcrProgress(null);
+      setScanning(false);
       if (fileInput.current) fileInput.current.value = "";
       if (cameraInput.current) cameraInput.current.value = "";
     }
   }
 
   function updateReview(id, key, value) {
-    const uncertaintyByField = {
-      subject: "subject",
-      day: "day",
-      start: "start time",
-      end: "end time",
-      room: "location",
-    };
+    setOverlapsConfirmed(false);
     setReview((current) => ({
       ...current,
-      classes: current.classes.map((item) => item.id === id ? {
-        ...item,
-        [key]: value,
-        uncertain: item.uncertain?.filter((field) => field !== uncertaintyByField[key]),
-      } : item),
+      classes: current.classes.map((item) => item.id === id ? { ...item, [key]: value } : item),
     }));
   }
 
   function addReviewClass() {
+    setOverlapsConfirmed(false);
     setReview((current) => ({
       ...current,
       classes: [...current.classes, {
         id: newId(),
         subject: "",
-        instructor: "",
+        professor: "",
         room: "",
-        day: "Monday",
-        start: "09:00",
-        end: "10:00",
+        days: [],
+        startTime: "",
+        endTime: "",
         color: CLASS_COLORS[current.classes.length % CLASS_COLORS.length],
-        uncertain: ["subject", "day", "start time", "end time"],
       }],
     }));
   }
 
   function confirmImport() {
     if (!review?.classes.length || invalidRows.length) return;
-    if (duplicateRows.length && !duplicatesConfirmed) {
-      setDuplicatesConfirmed(true);
+    if (overlapRows.length && !overlapsConfirmed) {
+      setOverlapsConfirmed(true);
       return;
     }
-    onImport(review.classes.map(({ uncertain, ...item }) => item));
+    onImport(review.classes);
     setReview(null);
-    setDuplicatesConfirmed(false);
+    setOverlapsConfirmed(false);
   }
 
   const renderDayColumn = (day) => (
     <div
       key={day}
       className={`schedule-day-column${day === todayName ? " today-column" : ""}`}
-      onClick={(event) => addAtTime(event, day)}
-      aria-label={`${day} schedule. Tap an empty time to add a class.`}
+      aria-label={`${day} schedule.`}
+      style={{ height: `${hourCount * HOUR_HEIGHT * zoom}px`, "--hour-height": `${HOUR_HEIGHT * zoom}px` }}
     >
       {entries.filter((entry) => entry.day === day).map((entry) => (
         <button
@@ -1095,62 +1047,103 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
           className="class-card"
           style={{
             "--class-accent": entry.item.color || CLASS_COLORS[0],
-            top: `${((entry.start - SCHEDULE_START) / 60) * HOUR_HEIGHT}px`,
-            height: `${((entry.end - entry.start) / 60) * HOUR_HEIGHT}px`,
+            top: `${((entry.start - firstHour * 60) / 60) * HOUR_HEIGHT * zoom}px`,
+            height: `${((entry.end - entry.start) / 60) * HOUR_HEIGHT * zoom}px`,
             left: `calc(${(entry.lane / entry.laneCount) * 100}% + 3px)`,
             width: `calc(${100 / entry.laneCount}% - 6px)`,
           }}
           onClick={() => onEdit(entry.item)}
-          aria-label={`${entry.item.subject}, ${day}, ${formatClock(entry.item.start)} to ${formatClock(entry.item.end)}, ${entry.item.room || "location not listed"}. Tap to view, edit, or delete.`}
-          title={`${entry.item.subject} | ${formatClock(entry.item.start)}-${formatClock(entry.item.end)} | ${entry.item.room || "Location not listed"}`}
+          aria-label={`${entry.item.subject}, ${day}, ${formatClock(entry.item.startTime)} to ${formatClock(entry.item.endTime)}, ${entry.item.room || "location not listed"}. Tap to edit or delete.`}
+          title={`${entry.item.subject} | ${formatClock(entry.item.startTime)}-${formatClock(entry.item.endTime)} | ${entry.item.room || "Location not listed"}`}
         >
           <strong>{entry.item.subject}</strong>
-          <span>{formatClock(entry.item.start)}-{formatClock(entry.item.end)} · {entry.item.room || "Location not listed"}</span>
+          <span>{formatClock(entry.item.startTime)}-{formatClock(entry.item.endTime)} · {entry.item.room || "Location not listed"}</span>
+          {entry.item.professor && <span>{entry.item.professor}</span>}
         </button>
       ))}
     </div>
   );
+
+  function changeZoom(value) {
+    setZoom(Math.min(2, Math.max(0.08, value)));
+  }
+
+  function fitSchedule() {
+    const availableHeight = Math.max(100, window.innerHeight * 0.62 - 66);
+    changeZoom(Math.min(1, availableHeight / (hourCount * HOUR_HEIGHT)));
+  }
+
+  function handlePinchStart(event) {
+    if (event.touches.length === 2) {
+      const [first, second] = event.touches;
+      pinchStart.current = {
+        distance: Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY),
+        zoom,
+      };
+    }
+  }
+
+  function handlePinchMove(event) {
+    if (event.touches.length !== 2 || !pinchStart.current) return;
+    const [first, second] = event.touches;
+    const distance = Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
+    changeZoom(pinchStart.current.zoom + (distance - pinchStart.current.distance) / 260);
+    if (event.cancelable) event.preventDefault();
+  }
 
   return (
     <section className="page schedule-page">
       <div className="page-heading">
         <div>
           <p className="eyebrow">REPEATS EVERY WEEK</p>
-          <h1>Class schedule</h1>
+          <h1>Classes</h1>
           <p className="page-subtitle">Your weekly timetable, with every class in its place.</p>
         </div>
-        <div className="schedule-actions">
-          <input ref={fileInput} className="visually-hidden" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" onChange={(event) => scanSchedule(event.target.files?.[0])} />
-          <input ref={cameraInput} className="visually-hidden" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" capture="environment" onChange={(event) => scanSchedule(event.target.files?.[0])} />
-          <button className="secondary-button scan-button" onClick={() => fileInput.current?.click()} disabled={Boolean(ocrProgress)}><ScanLine size={17} /> Scan schedule</button>
-          <button className="secondary-button camera-button" onClick={() => cameraInput.current?.click()} disabled={Boolean(ocrProgress)}><Camera size={17} /> Take photo</button>
-          <button className="primary-button" onClick={() => onAdd(SCHEDULE_DAYS.includes(todayName) ? todayName : "Monday", "09:00")}><Plus size={17} /> Add class</button>
+        <div className="add-class-menu">
+          <button className="primary-button add-class-trigger" aria-expanded={addMenuOpen} onClick={() => setAddMenuOpen((open) => !open)}><Plus size={17} /> Add class</button>
+          {addMenuOpen && (
+            <div className="add-class-options">
+              <button onClick={() => { setAddMenuOpen(false); onAdd(todayName, "09:00"); }}><Pencil size={16} /> Add manually</button>
+              <button onClick={() => cameraInput.current?.click()} disabled={scanning}><Camera size={16} /> Take photo</button>
+              <button onClick={() => fileInput.current?.click()} disabled={scanning}><Upload size={16} /> Upload / scan image</button>
+            </div>
+          )}
         </div>
       </div>
-      <p className="scanner-privacy">Images are read on this device. Nothing is uploaded.</p>
-      {ocrProgress && (
-        <div className="scan-progress" role="status" aria-live="polite">
-          <span>{ocrProgress.status}</span><progress max="1" value={ocrProgress.progress} />
-        </div>
-      )}
+      <input ref={fileInput} className="visually-hidden" type="file" accept="image/*" onChange={(event) => scanSchedule(event.target.files?.[0])} />
+      <input ref={cameraInput} className="visually-hidden" type="file" accept="image/*" capture="environment" onChange={(event) => scanSchedule(event.target.files?.[0])} />
+      <details className="class-ai-settings">
+        <summary>Gemini scan settings</summary>
+        <label>Gemini API key
+          <input type="password" autoComplete="off" value={apiKeyInput} onChange={(event) => setApiKeyInput(event.target.value)} onBlur={() => onSaveApiKey(apiKeyInput)} placeholder={import.meta.env.VITE_GEMINI_API_KEY ? "Using environment key (or paste a local key)" : "Paste your Gemini API key"} />
+        </label>
+        <small>Your key is stored only in this browser’s local storage. Images are sent to Google Gemini when you scan.</small>
+      </details>
+      {scanning && <div className="scan-progress" role="status" aria-live="polite"><span>Scanning your schedule with Gemini…</span><span className="loading-spinner" /></div>}
       {scanError && <div className="scan-error" role="alert">{scanError}</div>}
-      {classes.length === 0 && <div className="schedule-empty-state">Add a class or tap a time in the grid to start planning your week.</div>}
+      {!entries.length && <div className="schedule-empty-state">{classes.length ? "No classes with valid days and times are in your schedule. Your timetable is ready below." : "Your weekly timetable is ready. Add a class to get started."}</div>}
+      <div className="schedule-zoom-controls" aria-label="Schedule zoom controls">
+        <button className="icon-button" aria-label="Zoom out" onClick={() => changeZoom(zoom - 0.15)}><ZoomOut size={17} /></button>
+        <span>{Math.round(zoom * 100)}%</span>
+        <button className="icon-button" aria-label="Zoom in" onClick={() => changeZoom(zoom + 0.15)}><ZoomIn size={17} /></button>
+        <button className="secondary-button fit-button" onClick={fitSchedule}><Maximize2 size={15} /> Fit</button>
+      </div>
       <div className="panel schedule-panel">
-        <div className="schedule-scroll">
+        <div className="schedule-scroll" onTouchStart={handlePinchStart} onTouchMove={handlePinchMove} onTouchEnd={() => { pinchStart.current = null; }}>
           <div className="schedule-grid">
             <div className="schedule-grid-header">
               <div className="schedule-time-heading">TIME</div>
               {SCHEDULE_DAYS.map((day) => (
                 <div key={day} className={`schedule-day-heading${day === todayName ? " today-column" : ""}`}>
-                  <span>{day.slice(0, 3)}</span><strong>{day}</strong>
+                  <strong>{day.slice(0, 3)}</strong>
                 </div>
               ))}
             </div>
             <div className="schedule-grid-body">
-              <div className="schedule-time-column" aria-hidden="true">
+              <div className="schedule-time-column" aria-hidden="true" style={{ height: `${hourCount * HOUR_HEIGHT * zoom}px`, "--hour-height": `${HOUR_HEIGHT * zoom}px` }}>
                 {hours.map((hour, index) => (
-                  <span key={hour} className={`schedule-time-label${index === hours.length - 1 ? " last-time-label" : ""}`} style={{ top: `${index * HOUR_HEIGHT}px` }}>
-                    {formatClock(formatTime(hour))}
+                  <span key={hour} className={`schedule-time-label${index === hours.length - 1 ? " last-time-label" : ""}`} style={{ top: `${index * HOUR_HEIGHT * zoom}px` }}>
+                    {formatClock(formatTime(hour === 24 * 60 ? 0 : hour))}
                   </span>
                 ))}
               </div>
@@ -1159,41 +1152,47 @@ function SchedulePage({ classes, today, onAdd, onEdit, onImport }) {
           </div>
         </div>
       </div>
-      <p className="schedule-note">Monday–Sunday are shown together; swipe horizontally on a small screen to see the full week. Tap a class to edit it or an empty time to add one.</p>
+      <p className="schedule-note">Classes repeat weekly. Pinch or use the controls to zoom; tap a class to edit or delete it.</p>
       {review && (
-        <Modal title="Review scanned classes" onClose={() => { setReview(null); setDuplicatesConfirmed(false); }} wide>
-          <p className="scan-review-copy">Review and correct everything before adding it. OCR can misread printed schedules; highlighted fields need your attention.</p>
+        <Modal title="Review scanned classes" onClose={() => { setReview(null); setOverlapsConfirmed(false); }} wide>
+          <p className="scan-review-copy">Review, edit, remove, or add classes before confirming. Unreadable details are left blank rather than guessed.</p>
           <div className="scan-review-list">
             {review.classes.map((item, index) => {
               const invalid = invalidRows.includes(item);
-              const duplicate = isDuplicateClass(item, classes);
+              const overlap = classesOverlap(item, classes)
+                || review.classes.slice(0, index).some((previous) => classesOverlap(item, [previous]));
               return (
-                <article key={item.id} className={`scan-review-card${invalid || item.uncertain?.length ? " needs-review" : ""}`}>
+                <article key={item.id} className={`scan-review-card${invalid ? " needs-review" : ""}`}>
                   <div className="scan-review-heading">
                     <strong>Class {index + 1}</strong>
-                    <button className="icon-button delete-button" aria-label={`Remove scanned class ${index + 1}`} onClick={() => setReview((current) => ({ ...current, classes: current.classes.filter((entry) => entry.id !== item.id) }))}><Trash2 size={16} /></button>
+                    <button className="icon-button delete-button" aria-label={`Remove scanned class ${index + 1}`} onClick={() => {
+                      setOverlapsConfirmed(false);
+                      setReview((current) => ({ ...current, classes: current.classes.filter((entry) => entry.id !== item.id) }));
+                    }}><Trash2 size={16} /></button>
                   </div>
                   <div className="scan-review-fields">
                     <label className={!item.subject.trim() ? "uncertain-field" : ""}>Subject / code<input value={item.subject} onChange={(event) => updateReview(item.id, "subject", event.target.value)} placeholder="Required" /></label>
-                    <label className={!SCHEDULE_DAYS.includes(item.day) ? "uncertain-field" : ""}>Day<select value={item.day} onChange={(event) => updateReview(item.id, "day", event.target.value)}><option value="">Choose day</option>{SCHEDULE_DAYS.map((day) => <option key={day}>{day}</option>)}</select></label>
-                    <label className={!item.start || item.uncertain?.includes("start time") ? "uncertain-field" : ""}>Start<input type="time" value={item.start} onChange={(event) => updateReview(item.id, "start", event.target.value)} /></label>
-                    <label className={!item.end || item.uncertain?.includes("end time") ? "uncertain-field" : ""}>End<input type="time" value={item.end} onChange={(event) => updateReview(item.id, "end", event.target.value)} /></label>
+                    <label>Professor<input value={item.professor} onChange={(event) => updateReview(item.id, "professor", event.target.value)} placeholder="Optional" /></label>
+                    <label className={!item.startTime ? "uncertain-field" : ""}>Start<input type="time" value={item.startTime} onChange={(event) => updateReview(item.id, "startTime", event.target.value)} /></label>
+                    <label className={!item.endTime ? "uncertain-field" : ""}>End<input type="time" value={item.endTime} onChange={(event) => updateReview(item.id, "endTime", event.target.value)} /></label>
                     <label className={!item.room ? "uncertain-field" : ""}>Room / location<input value={item.room} onChange={(event) => updateReview(item.id, "room", event.target.value)} placeholder="Optional" /></label>
                     <label>Color<input className="scan-color-input" type="color" value={item.color || CLASS_COLORS[0]} onChange={(event) => updateReview(item.id, "color", event.target.value)} aria-label="Class color" /></label>
                   </div>
-                  {invalid && <p className="scan-row-warning"><AlertTriangle size={15} />Add a subject and weekday, and check that the class time is valid (7:00 AM–8:00 PM).</p>}
-                  {!invalid && item.uncertain?.length > 0 && <p className="scan-row-warning"><AlertTriangle size={15} />Please verify: {item.uncertain.join(", ")}.</p>}
-                  {duplicate && <p className="scan-row-warning"><AlertTriangle size={15} />This looks like a class already in your schedule. It will only be added if you confirm below.</p>}
+                  <fieldset className="review-days">
+                    <legend className={!item.days.length ? "uncertain-field" : ""}>Days</legend>
+                    {SCHEDULE_DAYS.map((day) => <label key={day}><input type="checkbox" checked={item.days.includes(day)} onChange={(event) => updateReview(item.id, "days", event.target.checked ? [...item.days, day] : item.days.filter((entry) => entry !== day))} />{day.slice(0, 3)}</label>)}
+                  </fieldset>
+                  {invalid && <p className="scan-row-warning"><AlertTriangle size={15} />Add a subject and at least one day, and check that the end time is after the start.</p>}
+                  {overlap && <p className="scan-row-warning"><AlertTriangle size={15} />This class overlaps another class. Nothing will be overwritten; confirm again to add it anyway.</p>}
                 </article>
               );
             })}
           </div>
           <button className="review-add" onClick={addReviewClass}><Plus size={16} /> Add another class</button>
-          {ocrText && <details className="ocr-text-details"><summary>See recognized text</summary><pre>{ocrText}</pre></details>}
           <div className="modal-actions scan-review-actions">
-            <button type="button" className="secondary-button" onClick={() => { setReview(null); setDuplicatesConfirmed(false); }}>Cancel</button>
+            <button type="button" className="secondary-button" onClick={() => { setReview(null); setOverlapsConfirmed(false); }}>Cancel</button>
             <button type="button" className="primary-button" disabled={!review.classes.length || invalidRows.length > 0} onClick={confirmImport}>
-              {duplicateRows.length && duplicatesConfirmed ? `Add ${review.classes.length} classes anyway` : "Confirm and Add to Schedule"}
+              {overlapRows.length && overlapsConfirmed ? `Add ${review.classes.length} classes anyway` : "Confirm and Add to Schedule"}
             </button>
           </div>
         </Modal>
@@ -1239,21 +1238,25 @@ function TaskModal({ task, due, onClose, onSave, onDelete }) {
 function ClassModal({ item, defaults, onClose, onSave, onDelete }) {
   const [form, setForm] = useState({
     subject: item?.subject || "",
-    instructor: item?.instructor || "",
+    professor: item?.professor || "",
     room: item?.room || "",
-    day: SCHEDULE_DAYS.includes(item?.day) ? item.day : defaults?.day || "Monday",
-    start: item?.start || defaults?.start || "09:00",
-    end: item?.end || formatTime(Math.min(timeToMinutes(defaults?.start || "09:00") + 60, SCHEDULE_END)),
+    days: item?.days || defaults?.days || ["Monday"],
+    startTime: item?.startTime || defaults?.startTime || "09:00",
+    endTime: item?.endTime || formatTime(Math.min(timeToMinutes(defaults?.startTime || "09:00") + 60, 23 * 60 + 59)),
     color: item?.color || CLASS_COLORS[0],
   });
   const [error, setError] = useState("");
   function submit(event) {
     event.preventDefault();
-    if (form.start < "07:00" || form.end > "20:00" || form.start >= form.end) {
-      setError("Choose a valid time between 7:00 AM and 8:00 PM, with the end after the start.");
+    if (!form.days.length) {
+      setError("Choose at least one day for this class.");
       return;
     }
-    onSave({ ...form, subject: form.subject.trim(), instructor: form.instructor.trim(), room: form.room.trim() });
+    if (timeToMinutes(form.startTime) === null || timeToMinutes(form.endTime) === null || form.startTime >= form.endTime) {
+      setError("Choose a valid start and end time, with the end after the start.");
+      return;
+    }
+    onSave({ ...form, subject: form.subject.trim(), professor: form.professor.trim(), room: form.room.trim() });
     onClose();
   }
   return (
@@ -1261,11 +1264,19 @@ function ClassModal({ item, defaults, onClose, onSave, onDelete }) {
       <form className="modal-form" onSubmit={submit}>
         <label>Subject name or code<input autoFocus required value={form.subject} onChange={(event) => setForm({ ...form, subject: event.target.value })} placeholder="e.g. Data Structures" /></label>
         <label>Room or location<input value={form.room} onChange={(event) => setForm({ ...form, room: event.target.value })} placeholder="e.g. Science Hall 204" /></label>
-        <label>Instructor (optional)<input value={form.instructor} onChange={(event) => setForm({ ...form, instructor: event.target.value })} placeholder="e.g. Prof. Lee" /></label>
-        <label>Day<select value={form.day} onChange={(event) => setForm({ ...form, day: event.target.value })}>{SCHEDULE_DAYS.map((day) => <option key={day}>{day}</option>)}</select></label>
+        <label>Professor’s name<input value={form.professor} onChange={(event) => setForm({ ...form, professor: event.target.value })} placeholder="e.g. Prof. Lee" /></label>
+        <fieldset className="class-days-field">
+          <legend>Days</legend>
+          <div className="class-day-options">{SCHEDULE_DAYS.map((day) => (
+            <label key={day}><input type="checkbox" checked={form.days.includes(day)} onChange={(event) => setForm({
+              ...form,
+              days: event.target.checked ? [...form.days, day] : form.days.filter((entry) => entry !== day),
+            })} />{day.slice(0, 3)}</label>
+          ))}</div>
+        </fieldset>
         <div className="form-row">
-          <label>Start time<input type="time" required min="07:00" max="19:59" value={form.start} onChange={(event) => setForm({ ...form, start: event.target.value })} /></label>
-          <label>End time<input type="time" required min="07:01" max="20:00" value={form.end} onChange={(event) => setForm({ ...form, end: event.target.value })} /></label>
+          <label>Start time<input type="time" required value={form.startTime} onChange={(event) => setForm({ ...form, startTime: event.target.value })} /></label>
+          <label>End time<input type="time" required value={form.endTime} onChange={(event) => setForm({ ...form, endTime: event.target.value })} /></label>
         </div>
         <label className="color-field">Accent color<div className="color-picker">{CLASS_COLORS.map((color) => (
           <button type="button" key={color} className={`color-swatch${form.color === color ? " selected" : ""}`} style={{ background: color }} onClick={() => setForm({ ...form, color })} aria-label={`Choose ${color}`} />
